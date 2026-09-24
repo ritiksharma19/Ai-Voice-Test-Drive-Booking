@@ -5,9 +5,11 @@ Context retrieval for the dealership agent: knowledge base first, Google second.
 Plan per query (RETRIEVAL_MODE=auto, the default):
   1. Small talk ("hi", "thanks", "ठीक है" …) and turns containing a phone
      number or email → no retrieval (contact details never leave the server).
-  2. Time-sensitive questions that don't mention the business ("petrol price
-     today", "weather in Pune") → web search only.
-  3. Everything else → knowledge base; if it has no answer → web search.
+  2. Off-topic or unclear messages (llm/topic_guard.py) → knowledge base only;
+     they never reach a search engine.
+  3. Time-sensitive car questions that don't mention the business ("petrol
+     price today in Pune") → web search only.
+  4. Everything else → knowledge base; if it has no answer → web search.
      While a booking is being collected, web search is skipped so answers
      like a name or a date are never sent to a search engine.
 
@@ -266,13 +268,16 @@ class RetrievalService:
     def mentions_business(self, query: str) -> bool:
         return bool(self._business_terms & set(tokenize(query)))
 
-    def plan(self, query: str, booking_active: bool = False) -> tuple[str, ...]:
-        """Sources in the order they are tried: () | ("kb",) | ("web",) | ("kb", "web")."""
+    def plan(self, query: str, booking_active: bool = False,
+             allow_web: bool = True) -> tuple[str, ...]:
+        """Sources in the order they are tried: () | ("kb",) | ("web",) | ("kb", "web").
+        allow_web=False (off-topic or unclear messages, see llm/topic_guard.py)
+        limits the lookup to the knowledge base."""
         mode = self.s.retrieval_mode
         if (mode == "off" or not query.strip() or is_conversational(query)
                 or contains_contact_details(query)):
             return ()
-        web_ok = self.web is not None and not booking_active
+        web_ok = self.web is not None and allow_web and not booking_active
         kb_ok = self.kb_backend == "local" or (
             self.kb_backend == "discovery"
             and (self.s.kb_multilingual or not _INDIC_SCRIPT_RE.search(query)))
@@ -288,7 +293,9 @@ class RetrievalService:
 
     async def get_context(self, query: str, wait: float | None = None,
                           sources: tuple[str, ...] | None = None) -> dict:
-        """Best context available within `wait` seconds; never raises."""
+        """Best context available within `wait` seconds for `query` (the text
+        that is searched; may include the previous question for follow-ups);
+        never raises."""
         sources = self.plan(query) if sources is None else sources
         if not sources:
             return _NONE

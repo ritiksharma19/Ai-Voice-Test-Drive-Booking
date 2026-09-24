@@ -1,11 +1,12 @@
 <!--
 SAMPLE DATA for a fictional dealership (Aurora Motors). Replace these files with
 your real catalog. Each "###" section becomes one searchable chunk, so keep one
-topic per section and repeat the model name in the heading.
+topic per section and repeat the model name in the heading. Add the model name in
+Hindi (or other scripts) to the "##" heading so Indic questions find the right car.
 -->
 # Aurora Motors car lineup
 
-## Aurora Pico (compact hatchback)
+## Aurora Pico (compact hatchback, ऑरोरा पिको)
 
 ### Aurora Pico overview
 The Aurora Pico is a five-seat compact hatchback for city driving and first-time buyers. It is easy to park, light to steer and economical to run.
@@ -22,7 +23,7 @@ Six airbags standard on all variants, ABS with EBD, ESC, rear parking camera fro
 ### Aurora Pico colours
 Arctic White, Graphite Grey, Fiery Red and Ocean Blue.
 
-## Aurora Sprint (mid-size sedan)
+## Aurora Sprint (mid-size sedan, ऑरोरा स्प्रिंट)
 
 ### Aurora Sprint overview
 The Aurora Sprint is a five-seat mid-size sedan with a large boot and a comfortable ride for families and highway driving.
@@ -39,7 +40,7 @@ Six airbags, ESC and hill-hold standard. Electric sunroof, ventilated front seat
 ### Aurora Sprint colours
 Pearl White, Titanium Silver, Midnight Black and Burgundy Red.
 
-## Aurora Ridge (7-seater SUV)
+## Aurora Ridge (7-seater SUV, ऑरोरा रिज)
 
 ### Aurora Ridge overview
 The Aurora Ridge is a seven-seat SUV for large families, long trips and rough roads, with an optional all-wheel drive.
@@ -56,7 +57,7 @@ Seven airbags, level 2 ADAS with adaptive cruise control on ZX, 360 degree camer
 ### Aurora Ridge colours
 Glacier White, Forest Green, Slate Grey and Desert Bronze.
 
-## Aurora Ion (electric SUV)
+## Aurora Ion (electric SUV, ऑरोरा आयन)
 
 ### Aurora Ion overview
 The Aurora Ion is a five-seat compact electric SUV with zero tailpipe emissions and very low running cost, about one rupee per kilometre when charged at home.

@@ -7,6 +7,9 @@ LLMOrchestrator — turns a customer utterance into a low-latency text stream.
     produce a first token within LLM_FIRST_TOKEN_TIMEOUT. A provider that
     just failed is skipped for a short cool-down so later turns don't pay
     the same timeout again.
+  • Topic guard (llm/topic_guard.py): only car / dealership messages may use
+    web search; anything else with no knowledge-base match is sent to the
+    model with a [TOPIC CHECK] note and politely declined.
   • Retrieval: knowledge base first, Google second (llm/retrieval.py). If a
     web lookup is still running after RETRIEVAL_FILLER_AFTER seconds, a short
     "let me check" is spoken in the customer's language so the line never
@@ -30,10 +33,12 @@ from booking import ActionFilter, BookingService, looks_like_booking
 from config.logging_config import get_logger
 from config.settings import Settings, get_settings
 from core.metrics import TurnTimer
+from core.privacy import contains_contact_details
 from llm.base import LLMBackend
 from llm.prompts import FILLERS, build_action_result, build_system_prompt, build_user_message
 from llm.providers import build_backend
-from llm.retrieval import RetrievalService
+from llm.retrieval import RetrievalService, is_conversational
+from llm.topic_guard import TopicGuard
 
 logger = get_logger("llm.orchestrator")
 
@@ -69,6 +74,8 @@ class LLMOrchestrator:
         self._sem = asyncio.Semaphore(self.s.llm_max_concurrency)
         self.conversations: OrderedDict[str, list[dict]] = OrderedDict()
         self.booking_turns: dict[str, int] = {}   # session → turns left in booking mode
+        self.guard = TopicGuard(self.s)
+        self.last_topic: dict[str, tuple[str, bool]] = {}   # session → (text, was on topic)
         logger.info("LLM chain: %s", " → ".join(b.describe() for b in self.backends))
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -100,6 +107,7 @@ class LLMOrchestrator:
             while len(self.conversations) > _MAX_SESSIONS:
                 old, _ = self.conversations.popitem(last=False)
                 self.booking_turns.pop(old, None)
+                self.last_topic.pop(old, None)
         else:
             self.conversations.move_to_end(session_id)
         return hist
@@ -117,6 +125,7 @@ class LLMOrchestrator:
     def release_session(self, session_id: str) -> None:
         self.conversations.pop(session_id, None)
         self.booking_turns.pop(session_id, None)
+        self.last_topic.pop(session_id, None)
 
     def _booking_active(self, session_id: str, user_text: str) -> bool:
         if looks_like_booking(user_text):
@@ -142,10 +151,20 @@ class LLMOrchestrator:
         history = list(self._history(session_id))
         self._append(session_id, "user", user_text)
 
-        sources = self.retrieval.plan(user_text, self._booking_active(session_id, user_text))
+        booking = self._booking_active(session_id, user_text)
+        on_topic = (booking or is_conversational(user_text)
+                    or contains_contact_details(user_text) or self.guard.is_on_topic(user_text))
+        search_text = user_text
+        prev_text, prev_on_topic = self.last_topic.get(session_id, ("", False))
+        if prev_on_topic and len(user_text.split()) <= 8 and not booking:
+            # Short follow-up ("and how far does it go?"): search it together
+            # with the previous question. Web search still needs this message
+            # itself to be on topic.
+            search_text = f"{prev_text} {user_text}"
+        sources = self.retrieval.plan(search_text, booking, allow_web=on_topic)
         spoken: list[str] = []          # text of the current round, for history
         retrieval = asyncio.create_task(
-            self.retrieval.get_context(user_text, self.s.retrieval_wait, sources))
+            self.retrieval.get_context(search_text, self.s.retrieval_wait, sources))
         try:
             if "web" in sources:
                 done, _ = await asyncio.wait({retrieval}, timeout=self.s.retrieval_filler_after)
@@ -160,9 +179,13 @@ class LLMOrchestrator:
                 retrieval.cancel()
         timer.mark("retrieval_done")
         source = found["source"]
+        topic_check = not on_topic and source == "none"
+        if topic_check:
+            logger.info("Topic guard: no car/dealership match — model asked to check scope")
+        self.last_topic[session_id] = (search_text[-200:], on_topic or source != "none")
 
-        messages = [*history, {"role": "user", "content":
-                               build_user_message(user_text, source, found["context"])}]
+        messages = [*history, {"role": "user", "content": build_user_message(
+            user_text, source, found["context"], topic_check=topic_check)}]
         system = build_system_prompt(self.s, language, self.bookings.now())
 
         llm_started = False

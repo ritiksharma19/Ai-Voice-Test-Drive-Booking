@@ -1,6 +1,6 @@
-# VoiceAgent
+# Multilingual Test Drive Booking Using Closed and Open Models
 
-**A real-time, multilingual voice agent for car dealerships. Customers ask about cars and book test drives or sales meetings by talking, in English or any of nine Indian languages.**
+**VoiceAgent is a real-time, multilingual voice agent for car dealerships. Customers ask about cars and book test drives or sales meetings by talking, in English or any of nine Indian languages.** It runs on closed models (Gemini, GPT, Claude, Sarvam, ElevenLabs) and open models (Whisper, Gemma via Ollama, AI4Bharat Indic-Seamless), in any mix, and switches automatically when a provider fails.
 
 A customer opens the dealership's website and talks. VoiceAgent answers questions about the cars (price, variants, mileage, EV range, features, finance, warranty) from the dealership's own **knowledge base**. If the knowledge base has no answer, it searches **Google**. When the customer is ready, it books a **test drive** or a **sales meeting**: it collects the details, checks the slot, saves the booking and reads back a booking ID.
 
@@ -36,23 +36,146 @@ The repository ships with a **sample fictional dealership** (Aurora Motors, Pune
 
 ## Architecture
 
+Two views of the same system: the **business flow** shows what a customer experiences and what the dealership gets; the **technical flow** shows every component a request passes through.
+
+### Business flow (for sales and management)
+
 ```mermaid
 flowchart TD
-    MIC["Browser microphone"] -->|"16 kHz PCM WAV over WebSocket"| STT
-    STT["Speech-to-text<br/>Whisper on GPU · Sarvam · OpenAI · Indic-Seamless"] --> LID["Language ID<br/>script-based, 10 languages"]
-    LID --> PLAN{"Retrieval plan"}
-    PLAN -->|"small talk, phone number"| LLM
-    PLAN -->|"car or dealership question"| KB["Knowledge base<br/>local Markdown or Discovery Engine"]
-    PLAN -->|"live question not about us"| WEB
-    KB -->|"answer found"| LLM
-    KB -->|"no answer"| WEB["Google Search<br/>Gemini grounding → Brave → scrapers"]
-    WEB --> LLM["LLM with CO-STAR prompt<br/>Gemini → OpenAI → Claude → Ollama"]
-    LLM -->|"#lt;action#gt; tag"| BOOK["Booking service<br/>validate · slot check · SQLite · webhook"]
-    BOOK -->|"ACTION RESULT"| LLM
-    LLM -->|"spoken text only"| CHUNK["Speech chunker<br/>first clause first"]
-    CHUNK --> TTS["Text-to-speech<br/>Sarvam · ElevenLabs · OpenAI · Edge"]
-    TTS -->|"MP3 chunks, in order"| SPK["Browser speaker"]
-    BOOK -.->|"booking card"| SPK
+    A(["Customer opens the dealership website<br/>and talks in their own language"]) --> B["Agent greets the customer<br/>as Priya from Aurora Motors"]
+    B --> C{"What does the<br/>customer want?"}
+
+    C -->|"Question about our cars<br/>price · mileage · EV range · features · finance"| D{"Answer in the dealership's<br/>verified catalog?"}
+    D -->|"Yes"| E["Answers with verified facts<br/>exact ex-showroom prices, never guessed"]
+    D -->|"No, but it is a car question"| G["Looks it up on Google and says it is public info,<br/>or offers a meeting with a sales consultant"]
+    C -->|"General car question<br/>fuel prices · EV charging · other brands"| G
+    C -->|"Unrelated question<br/>news · sports · homework · jokes"| H["GUARDRAIL: politely declines<br/>and steers back to cars"]
+    H --> C
+
+    E --> I{"Buying<br/>interest?"}
+    G --> I
+    I -->|"No"| K(["Customer leaves informed<br/>and can come back any time"])
+    I -->|"Yes"| J["Offers a free test drive<br/>or sales meeting, once"]
+    J --> L
+    C -->|"Wants a test drive<br/>or a meeting"| L["Collects car · showroom · date and time<br/>· name · mobile number"]
+
+    L --> M["Reads the details back<br/>and the customer confirms"]
+    M --> N{"Slot<br/>available?"}
+    N -->|"No"| O["Offers the 3 nearest<br/>free slots"]
+    O --> M
+    N -->|"Yes"| P["BOOKED: booking ID read aloud<br/>and shown on screen"]
+    P --> Q["Booking saved and sent<br/>to the CRM / sales team"]
+    Q --> R["Sales team prepares<br/>the car and a consultant"]
+    R --> S(["Customer visits the showroom<br/>test drive → purchase"])
+
+    classDef outcome fill:#e6f1ea,stroke:#3f7d58,color:#1f1e1c
+    classDef guard fill:#f4eee2,stroke:#8a6d3b,color:#1f1e1c
+    class P,Q,R,S outcome
+    class H guard
+```
+
+| What the dealership gets | How |
+|---|---|
+| A salesperson on the website 24 × 7, in 10 languages | Voice in English, Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi |
+| Qualified leads, not just chats | Test drives and meetings booked with name, mobile, car, showroom and slot, sent straight to the CRM |
+| No wrong promises | Prices, specs and offers come only from your catalog; the agent never confirms a booking the system didn't save |
+| On-brand, on-topic conversations | Unrelated questions are declined and never searched, so they cost almost nothing |
+| Full control | Edit the Markdown catalog to change what the agent knows; no retraining |
+
+### Technical flow (for engineers)
+
+```mermaid
+flowchart TD
+    subgraph BROWSER["1 · Browser · static/app.js"]
+        B1["Mic capture<br/>echo cancellation · noise suppression · AGC"] --> B2["Client VAD<br/>RMS vs calibrated noise floor"]
+        B2 -->|"pause ≥ VAD_SILENCE_MS (550 ms)"| B3["Encode 16 kHz mono PCM WAV"]
+        B2 -->|"customer talks over the agent"| B4["Barge-in: stop playback,<br/>send interrupt"]
+        B5["Typed message"]
+    end
+
+    B3 -->|"binary frame"| W1
+    B5 -->|"JSON text"| W1
+    B4 -->|"JSON interrupt"| W1
+
+    subgraph SERVER["2 · WebSocket /ws · server.py"]
+        W1["Session id · frame-size limit<br/>cancel the running turn on new input"] --> W2["One asyncio task per turn<br/>TurnTimer starts"]
+    end
+
+    W2 -->|"audio"| S1
+    W2 -->|"text"| L1
+
+    subgraph STT["3 · Speech-to-text · stt/"]
+        S1["Parse WAV · resample to 16 kHz<br/>Silero VAD trims silence"] --> S2{"STT_PROVIDER"}
+        S2 --> S3["faster-whisper large-v3-turbo<br/>CUDA fp16 / CPU int8 · open"]
+        S2 --> S4["Sarvam saaras:v3 · closed"]
+        S2 --> S5["OpenAI gpt-4o-mini-transcribe · closed"]
+        S2 --> S6["AI4Bharat Indic-Seamless · open"]
+    end
+
+    S3 & S4 & S5 & S6 --> L1
+
+    subgraph UNDERSTAND["4 · Understand · core/lang.py · booking/intent.py · llm/topic_guard.py"]
+        L1["Language ID<br/>script ranges · Lingua for hi vs mr"] --> L2["Booking mode<br/>intent regex, active for 6 turns"]
+        L2 --> L3{"Topic guard"}
+        L3 -->|"car words · our models · booking · small talk"| L4["On topic<br/>web search allowed"]
+        L3 -->|"no match"| L5["Unclear<br/>knowledge base only"]
+        L4 --> L6["Short follow-up?<br/>merge with the previous question"]
+        L5 --> L6
+    end
+
+    L6 --> R1
+
+    subgraph RETRIEVE["5 · Retrieve · llm/retrieval.py · llm/knowledge_base.py · llm/web_search.py"]
+        R1{"Retrieval plan"} -->|"small talk · phone or email"| R0["No lookup"]
+        R1 -->|"live car question,<br/>not about us"| R4
+        R1 -->|"everything else"| R2["Knowledge base<br/>local BM25 + coverage ≥ KB_MIN_COVERAGE<br/>or Discovery Engine, hedged at 0.6 s"]
+        R2 -->|"answer"| R5["[KNOWLEDGE BASE] context"]
+        R2 -->|"no answer, on topic"| R4["Google via Gemini grounding<br/>→ Brave API → DuckDuckGo + Bing race"]
+        R2 -->|"no answer, unclear topic"| R6["[TOPIC CHECK] note"]
+        R4 --> R7["[WEB RESULTS] context"]
+        R4 -.->|"still running after 0.7 s"| F1["Spoken filler<br/>in the customer's language"]
+        RC[("Result cache 5 min<br/>in-flight de-duplication")] -.- R2
+    end
+
+    R0 & R5 & R6 & R7 --> P1
+
+    subgraph GENERATE["6 · Generate · llm/orchestrator.py · llm/prompts.py"]
+        P1["CO-STAR system prompt<br/>+ GUARDRAILS + BOOKING rules + examples<br/>+ 14-day calendar + 8 turns of history"] --> P2["LLM chain behind a semaphore<br/>Gemini → GPT → Claude · closed<br/>Ollama Gemma · open"]
+        P2 -->|"error or no first token in 6 s"| P3["Fail over to next provider<br/>20 s cool-down"]
+        P3 --> P2
+        P2 --> P4["ActionFilter<br/>streams speech, hides the #lt;action#gt; tag"]
+    end
+
+    P4 -->|"action tag"| K1
+    P4 -->|"spoken text"| T1
+
+    subgraph BOOK["7 · Booking · booking/service.py"]
+        K1{"Action"} -->|"check_availability"| K2["Free slots per showroom"]
+        K1 -->|"book_appointment"| K3["Validate mobile incl. Indic digits · model ·<br/>showroom · hours · lead time · days ahead"]
+        K3 -->|"invalid"| K6["Fields to re-ask<br/>+ 3 alternative slots"]
+        K3 -->|"valid"| K4["Lock → duplicate check → capacity check<br/>→ INSERT into SQLite"]
+        K4 --> K5["Async webhook POST to CRM"]
+        K4 --> K7["booking event → confirmation card"]
+    end
+
+    K2 & K4 & K6 -->|"[ACTION RESULT] → next LLM round, max 2 per turn"| P2
+
+    subgraph SPEAK["8 · Speak · core/chunker.py · tts/"]
+        T1["Speech chunker<br/>first clause after 24 chars, then sentences"] --> T2["TTS router per language<br/>Sarvam bulbul · ElevenLabs · OpenAI · Edge fallback"]
+        T2 --> T3["Concurrent synthesis<br/>strict in-order send · LRU cache"]
+    end
+
+    F1 --> T1
+    T3 -->|"audio_chunk MP3"| B6["Browser plays chunks in order"]
+    K7 --> B6
+
+    subgraph OPS["9 · Operations"]
+        O1["Per-stage timings → /metrics p50 / p95"]
+        O2["Logs with phone and email masked<br/>logs/voiceagent.log"]
+        O3["/health · /config · /bookings with ADMIN_TOKEN"]
+    end
+
+    W2 -.-> O1
 ```
 
 Each user turn runs as its own `asyncio.Task`, so a barge-in cancels it immediately. All network I/O is async over pooled keep-alive connections. Local GPU inference runs in a worker thread, so the event loop never blocks.
@@ -70,10 +193,20 @@ Every question is routed before the LLM starts:
 | Small talk, or a turn containing a phone number or email | No lookup (contact details never go to a search engine) | "Thanks!", "my number is 98765 43210" |
 | About our cars or dealership | **Knowledge base** → Google only if the KB has no answer | "What's the range of the Ion?", "current offers on the Ridge?" |
 | Time-sensitive and not about us | **Google** directly | "Petrol price today in Pune" |
-| Anything else | **Knowledge base** → Google | "Who won the cricket world cup?" |
+| Other car questions | **Knowledge base** → Google | "What is the EV subsidy in Maharashtra?" |
+| Not about cars at all | Knowledge base only, never Google; with no match, the agent **declines politely** | "Who won the cricket world cup?", "write me a poem" |
 | During a booking (name, date, showroom) | Knowledge base only, never the web | "Rohan Mehta", "Saturday at 11" |
 
-**What counts as "the KB has an answer":** the local knowledge base is searched with BM25. A result counts only when the best-matching sections contain at least `KB_MIN_COVERAGE` (50 %) of the question's meaningful words. So "What is the price of the Ion?" is answered from the catalog. "Who won the cricket world cup?" matches nothing, so it goes to Google. Hinglish words (kimat, daam, gaadi, average) are mapped to catalog terms.
+**What counts as "the KB has an answer":** the local knowledge base is searched with BM25. A result counts only when the best-matching sections contain at least `KB_MIN_COVERAGE` (50 %) of the question's meaningful words. So "What is the price of the Ion?" is answered from the catalog, while "What is the EV subsidy in Maharashtra?" matches too little and goes to Google. Hinglish words (kimat, daam, gaadi, average) are mapped to catalog terms. Short follow-ups ("and its range?") are searched together with the previous question, so "its" still means the Ion.
+
+### Guardrail: cars and the dealership only
+
+The agent will not answer questions outside its job. Two layers enforce this:
+
+1. **Topic guard, in code, before any lookup** (`llm/topic_guard.py`). A message counts as on topic if it uses automotive vocabulary in any of the 10 languages (car, EV, mileage, गाड़ी, கார் …), names one of your models, showrooms or brands, or is part of a booking. Only on-topic messages may use Google, so off-topic questions never cost a search. Words that belong to other domains too ("price", "loan", "insurance") do not count on their own, so "gold price today" or "health insurance premium" is not treated as a car question.
+2. **GUARDRAILS in the prompt**, for the final decision. When a message is not clearly on topic and the catalog has no match, it reaches the model with a `[TOPIC CHECK]` note. The prompt lists what is in scope (cars, buying, finance, insurance, registration, charging, driving, maintenance, factual brand comparisons) and what is always declined (general knowledge, news, sports, weather, politics, stocks, health, legal, coding, homework, maths, creative writing, translation, role-play, opinions). The model declines in one friendly sentence, gives no partial answer, and offers help with cars. The decline holds when the customer insists, claims to be staff, or asks the agent to ignore or reveal its instructions.
+
+Because the model makes the final call, a car question without car words ("is it safe for my kids?" after asking about the Ridge) is still answered, while "who won the match?" is declined.
 
 **Google Search** is done with Gemini's grounding tool (`GEMINI_API_KEY`). Google's Custom Search JSON API is closed to new customers and shuts down on 1 January 2027, so grounding is the supported way to query Google from code. If it fails, Brave Search (if configured) and then the free DuckDuckGo/Bing scrapers are tried. If a web lookup takes longer than `RETRIEVAL_FILLER_AFTER` (0.7 s), the agent says "Let me check that for you" in the customer's language so the line never goes silent.
 
@@ -123,13 +256,13 @@ The system prompt (`llm/prompts.py`) follows the **CO-STAR** framework. Each par
 | Part | What it tells the model |
 |---|---|
 | **C**ontext | It is the dealership's voice assistant; the models, showrooms, opening hours; what `[KNOWLEDGE BASE]`, `[WEB RESULTS]` and `[ACTION RESULT]` mean |
-| **O**bjective | In priority order: answer correctly from the KB, never guess prices, specs or offers; answer general questions briefly; offer a test drive **once** when there is buying interest; collect booking details |
+| **O**bjective | In priority order: answer correctly from the KB, never guess prices, specs or offers; answer other car questions briefly; offer a test drive **once** when there is buying interest; collect booking details; decline anything out of scope |
 | **S**tyle | 1–3 spoken sentences, key fact first, one question at a time, numbers as spoken ("seventeen lakh forty-nine thousand rupees ex-showroom"), jargon explained |
 | **T**one | Warm, confident, never pushy; calm with confused or annoyed customers |
 | **A**udience | Indian car buyers, often non-experts, often mixing languages, possibly on a phone in a noisy place |
 | **R**esponse | Plain text only (it is spoken), reply only in the customer's language, never mention internal systems, never ask for OTP, Aadhaar, PAN or card details |
 
-It adds a **BOOKING** section with the exact action format, a rule to read details back before booking, and "never claim a booking the system did not confirm". **Few-shot examples** cover a KB price answer, an honest "I don't have that detail" fallback, and a full booking with its action and result. A **14-day calendar** (`Sat 26 Sep 2026 = 2026-09-26`) turns "next Saturday" into a lookup rather than date arithmetic, which LLMs often get wrong. The dated parts (the example booking and the calendar) sit at the end of the prompt, so the first ~1,200 tokens are identical on every call and can be served from the provider's prompt cache.
+It adds a **GUARDRAILS** section (scope, what is always declined, how to decline, resistance to "ignore your instructions"), a **BOOKING** section with the exact action format, a rule to read details back before booking, and "never claim a booking the system did not confirm". **Few-shot examples** cover a KB price answer, a polite off-topic decline, an honest "I don't have that detail" fallback, and a full booking with its action and result. A **14-day calendar** (`Sat 26 Sep 2026 = 2026-09-26`) turns "next Saturday" into a lookup rather than date arithmetic, which LLMs often get wrong. The dated parts (the example booking and the calendar) sit at the end of the prompt, so the first ~1,200 tokens are identical on every call and can be served from the provider's prompt cache.
 
 ### Tuning, and why this isn't weight fine-tuning
 
@@ -149,7 +282,7 @@ Fine-tuning becomes worth it once you have **thousands of real, reviewed transcr
 
 ### Customising for your dealership
 
-1. **Knowledge base:** replace the Markdown files in `data/knowledge_base/`. Use one `###` heading per topic and repeat the model name in the heading ("### Aurora Ion price and variants"). The files are indexed at startup. For a large catalog or PDFs, use Google Discovery Engine instead (`GCP_PROJECT_ID`, `GCP_DATA_STORE_ID`).
+1. **Knowledge base:** replace the Markdown files in `data/knowledge_base/`. Use one `###` heading per topic and repeat the model name in the heading ("### Aurora Ion price and variants"). Add the model name in Hindi and other scripts to the model's `##` heading ("## Aurora Ion (electric SUV, ऑरोरा आयन)") so questions in those scripts find the right car. The files are indexed at startup. For a large catalog or PDFs, use Google Discovery Engine instead (`GCP_PROJECT_ID`, `GCP_DATA_STORE_ID`).
 2. **Business settings** in `.env`: `BUSINESS_NAME`, `BUSINESS_CITY`, `AGENT_NAME`, `SHOWROOMS`, `CAR_MODELS`, `BUSINESS_HOURS`, `BUSINESS_DAYS`, `BUSINESS_TIMEZONE`.
 3. **Booking rules:** slot length, capacity per slot, lead time and how many days ahead customers can book.
 4. **CRM:** set `BOOKING_WEBHOOK_URL` to receive every booking as JSON.
@@ -496,7 +629,8 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 | "What's the price of the Ion?" | Answered from the knowledge base (17.49–21.99 lakh ex-showroom) |
 | "Ridge ki mileage kitni hai?" | Knowledge base, answered in Hindi |
 | "What documents do I need for a test drive?" | Knowledge base (dealership policy) |
-| "Who won the last cricket world cup?" | Not in the knowledge base → "Let me check that for you" → Google |
+| "What is the EV subsidy in Maharashtra?" | Car question not in the knowledge base → "Let me check that for you" → Google |
+| "Who won the last cricket world cup?" | Off topic → never searched; the agent politely declines and offers help with cars |
 | "I want to test drive the Ridge on Saturday at 11 at Baner" | Starts a booking: the agent asks for your name and mobile, reads everything back, books, and a confirmation card appears |
 | "Book a meeting tomorrow at 9 AM" | The agent says slots start at 10 AM and suggests one; if the model tries 9 AM anyway, the server rejects it and returns the nearest free slots |
 
@@ -673,6 +807,7 @@ VoiceAgent/
 │   ├── prompts.py            CO-STAR system prompt, few-shot examples, calendar, fillers
 │   ├── providers/            gemini.py · openai_llm.py · anthropic_llm.py · ollama_llm.py
 │   ├── knowledge_base.py     Local Markdown KB with BM25 search and coverage check
+│   ├── topic_guard.py        Multilingual on-topic check (cars / dealership only)
 │   ├── retrieval.py          KB-first routing → Google fallback, cache
 │   └── web_search.py         Google (Gemini grounding) · Brave API · DuckDuckGo + Bing race
 ├── booking/
@@ -692,7 +827,7 @@ VoiceAgent/
 │   ├── sarvam.py · cloud_tts.py (OpenAI, ElevenLabs) · edge_tts_engine.py
 ├── static/                   index.html + app.js (browser client)
 ├── scripts/benchmark.py      Component and end-to-end latency benchmarks
-├── tests/                    44 offline tests: pipeline, WebSocket, KB, booking, prompt (python -m pytest)
+├── tests/                    60 offline tests: pipeline, WebSocket, KB, guardrail, booking, prompt (python -m pytest)
 ├── requirements*.txt         core · gpu · kb · seamless
 └── .env.example
 ```

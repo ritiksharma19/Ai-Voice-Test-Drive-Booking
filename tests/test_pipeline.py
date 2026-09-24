@@ -20,6 +20,7 @@ from core.lang import detect_language, script_language
 from llm.base import LLMBackend
 from llm.orchestrator import AllProvidersFailed, LLMOrchestrator
 from llm.retrieval import RetrievalService
+from llm.topic_guard import TopicGuard
 from stt.audio import encode_wav, parse_wav, to_16k
 
 
@@ -144,6 +145,8 @@ def make_orchestrator(*backends, settings: Settings | None = None,
     orch.retrieval = retrieval or RetrievalService(orch.s)
     orch.bookings = bookings or BookingService(orch.s)
     orch.booking_turns = {}
+    orch.guard = TopicGuard(orch.s)
+    orch.last_topic = {}
     orch.backends = list(backends)
     orch._cooldown_until = {}
     orch._sem = asyncio.Semaphore(4)

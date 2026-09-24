@@ -27,7 +27,9 @@ logger = get_logger("llm.knowledge_base")
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+# \w alone splits Indic words at vowel signs (कीमत → क, मत), so the Indic
+# blocks (Devanagari … Malayalam, U+0900–U+0DFF) are matched explicitly.
+_TOKEN_RE = re.compile(r"[\wऀ-෿]+", re.UNICODE)
 
 _STOPWORDS = frozenset("""
 a an and any are as at be by can could do does did for from get give has have how i
@@ -52,10 +54,19 @@ _SYNONYMS = {
 
 
 def _stem(token: str) -> str:
+    """Light English stemmer: charge / charges / charged / charging → charg."""
+    if not token.isascii() or token.isdigit():
+        return token
     if len(token) > 4 and token.endswith("es") and not token.endswith("ses"):
-        return token[:-2]
-    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-        return token[:-1]
+        token = token[:-2]
+    elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        token = token[:-1]
+    if len(token) > 5 and token.endswith("ing"):
+        token = token[:-3]
+    elif len(token) > 4 and token.endswith("ed"):
+        token = token[:-2]
+    if len(token) > 4 and token.endswith("e"):
+        token = token[:-1]
     return token
 
 
