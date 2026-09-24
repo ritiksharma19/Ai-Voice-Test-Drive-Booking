@@ -1,0 +1,6 @@
+# NVIDIA CUDA 12 runtime libraries for faster-whisper / CTranslate2.
+# Installs cuBLAS + cuDNN 9 as pip wheels, so no system CUDA Toolkit is needed —
+# only a recent NVIDIA driver (R550+ recommended). config/device.py registers
+# these DLLs automatically on Windows.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12>=9,<10

@@ -1,0 +1,24 @@
+# Environment / secrets
+.env
+service.json
+*.json.key
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# Models
+models/
+*.pth
+*.pt
+*.onnx
+
+# Logs & benchmark output
+logs/
+*.log
+bench_results/

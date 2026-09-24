@@ -1,0 +1,3 @@
+# Optional: enterprise knowledge base via Google Cloud Discovery Engine (Vertex AI Search).
+# Needed only when GCP_PROJECT_ID and GCP_DATA_STORE_ID are set.
+google-cloud-discoveryengine>=0.13

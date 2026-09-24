@@ -1,0 +1,8 @@
+# Optional: AI4Bharat Indic-Seamless STT (STT_PROVIDER=seamless) on an NVIDIA GPU.
+# PyTorch CUDA 12.8 wheels (Windows + Linux). Change cu128 to match your driver if needed:
+# https://pytorch.org/get-started/locally/
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+transformers>=4.45
+sentencepiece>=0.2
+protobuf>=4.25

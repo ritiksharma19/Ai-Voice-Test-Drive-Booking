@@ -1,0 +1,31 @@
+# ════════════════════════════════════════════════════════════════════
+# VoiceAgent — core requirements (Python 3.11 – 3.12, Windows / Linux)
+#
+#   pip install -r requirements.txt                 # CPU or cloud STT
+#   pip install -r requirements-gpu.txt             # + NVIDIA CUDA runtime for local Whisper
+#   pip install -r requirements-kb.txt              # + Google Discovery Engine knowledge base
+#   pip install -r requirements-seamless.txt        # + Indic-Seamless STT (PyTorch CUDA)
+# ════════════════════════════════════════════════════════════════════
+
+# ── Web server ──────────────────────────────────────────
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-dotenv>=1.0
+
+# ── HTTP / scraping (one async client for every REST call) ──
+httpx[http2]>=0.27
+beautifulsoup4>=4.12
+lxml>=5.0
+ddgs>=9.0
+
+# ── LLM providers (all optional at runtime; configure via .env) ──
+google-genai>=2.0
+openai>=2.0
+anthropic>=1.0
+ollama>=0.5
+
+# ── Speech ──────────────────────────────────────────────
+numpy>=1.26
+faster-whisper>=1.1          # Whisper on CTranslate2 (CUDA / CPU) + bundled Silero VAD (ONNX)
+edge-tts>=7.0                # free neural voices, universal TTS fallback
+lingua-language-detector>=2.0   # Hindi vs Marathi disambiguation (Devanagari)
