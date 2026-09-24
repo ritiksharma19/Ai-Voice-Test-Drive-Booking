@@ -1,16 +1,16 @@
 """
 llm/web_search.py
-Web search for real-time questions.
+Web search, used when the knowledge base has no answer.
 
-  • BRAVE_SEARCH_API_KEY set → official Brave Search API (fast, reliable, ToS-safe;
-    recommended for production). Scrapers are used only if the API fails.
-  • Otherwise DuckDuckGo (ddgs) and Bing HTML are queried *concurrently* and
-    the first non-empty result wins (measured: ~0.3 s vs 2–4.5 s for the old
-    DDG → Brave → Bing sequential cascade; Brave's HTML page now returns 429
-    to scrapers, so only its official API is used).
-  • Gold / silver price questions also scrape goodreturns.in in parallel and
-    prefer it when it answers.
+Engines, tried in order (WEB_SEARCH_PROVIDER=auto):
+  1. Google — Gemini grounding with Google Search (uses GEMINI_API_KEY). The
+     Custom Search JSON API is closed to new customers and shuts down on
+     2027-01-01, so grounding is Google's supported way to search from code.
+     Returns a short sourced summary written for the voice agent to use.
+  2. Brave Search API — if BRAVE_SEARCH_API_KEY is set.
+  3. DuckDuckGo (ddgs) and Bing HTML, raced concurrently — free, best-effort.
 
+Gold / silver price questions also scrape goodreturns.in in parallel.
 All HTTP goes through the shared pooled client (core.http).
 """
 from __future__ import annotations
@@ -62,15 +62,43 @@ def _format_results(results: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+_GROUNDING_PROMPT = """Search the web and answer for a car dealership's voice assistant in {region}.
+Question: {query}
+Reply in English with a factual summary of at most 120 words: specific numbers,
+prices with currency, dates and names. If sources disagree, say so. No markdown."""
+
+
 class WebSearchService:
     def __init__(self, settings: Settings | None = None) -> None:
         self.s = settings or get_settings()
+        self._genai = None
+        self.engines = self._engine_order()
+        logger.info("Web search engines: %s", " → ".join(self.engines))
+
+    def _engine_order(self) -> list[str]:
+        google_ok = bool(self.s.gemini_api_key)
+        brave_ok = bool(self.s.brave_search_api_key)
+        wanted = self.s.web_search_provider
+        if wanted == "google" and not google_ok:
+            logger.warning("WEB_SEARCH_PROVIDER=google needs GEMINI_API_KEY — using fallbacks")
+        if wanted == "brave" and not brave_ok:
+            logger.warning("WEB_SEARCH_PROVIDER=brave needs BRAVE_SEARCH_API_KEY — using fallbacks")
+        order = {"google": ["google", "brave", "scrape"], "brave": ["brave", "google", "scrape"],
+                 "scrape": ["scrape"]}.get(wanted, ["google", "brave", "scrape"])
+        return [e for e in order
+                if (e != "google" or google_ok) and (e != "brave" or brave_ok)]
+
+    def describe(self) -> str:
+        return "+".join(self.engines)
 
     async def warmup(self) -> None:
         """Pre-open TLS connections to the search hosts."""
         client = get_http_client()
-        hosts = (["https://api.search.brave.com"] if self.s.brave_search_api_key
-                 else ["https://www.bing.com"])
+        hosts = []
+        if "brave" in self.engines:
+            hosts.append("https://api.search.brave.com")
+        if "scrape" in self.engines:
+            hosts.append("https://www.bing.com")
         await asyncio.gather(*(client.head(h, headers=BROWSER_HEADERS, timeout=3)
                                for h in hosts), return_exceptions=True)
 
@@ -97,13 +125,55 @@ class WebSearchService:
             return ""
 
     async def _general(self, query: str) -> str:
-        if self.s.brave_search_api_key:
-            results = await self._brave_api(query)
-            if results:
-                return _format_results(results)
-        return _format_results(await self._race_scrapers(query))
+        for engine in self.engines:
+            if engine == "google":
+                text = await self._google(query)
+                if text:
+                    return text
+            elif engine == "brave":
+                results = await self._brave_api(query)
+                if results:
+                    return _format_results(results)
+            else:
+                return _format_results(await self._race_scrapers(query))
+        return ""
 
     # ── engines ───────────────────────────────────────────────────────────────
+
+    async def _google(self, query: str) -> str:
+        """Gemini grounded on Google Search → short sourced summary, or ''."""
+        try:
+            from google import genai  # type: ignore
+            from google.genai import types  # type: ignore
+            if self._genai is None:
+                self._genai = genai.Client(
+                    api_key=self.s.gemini_api_key,
+                    http_options=types.HttpOptions(timeout=int(self.s.retrieval_timeout * 1000)))
+            config = types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                max_output_tokens=400,
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"))
+            resp = await self._genai.aio.models.generate_content(
+                model=self.s.google_search_model,
+                contents=_GROUNDING_PROMPT.format(region=self.s.search_region, query=query),
+                config=config)
+        except Exception as exc:
+            logger.warning("Google search (Gemini grounding) failed: %r", exc)
+            return ""
+        text = (resp.text or "").strip()
+        if not text:
+            return ""
+        titles: list[str] = []
+        try:
+            meta = resp.candidates[0].grounding_metadata
+            for chunk in (meta.grounding_chunks or [])[:_MAX_RESULTS]:
+                if chunk.web and chunk.web.title and chunk.web.title not in titles:
+                    titles.append(chunk.web.title)
+        except (AttributeError, IndexError, TypeError):
+            pass
+        logger.info("web: google grounding answered (%d sources)", len(titles))
+        sources = f"\nSources: {', '.join(titles)}" if titles else ""
+        return f"Google Search summary:\n{text}{sources}"
 
     async def _race_scrapers(self, query: str) -> list[dict]:
         engines = {

@@ -69,6 +69,22 @@ def test_audio_turn_end_to_end():
     assert {"stt", "llm_ttft", "first_audio", "total"} <= timings.keys()
 
 
+def test_booking_event_reaches_client():
+    from tests.test_business import BOOK_CALL, ScriptedBackend, bookings
+    server.engines.stt, server.engines.tts = FakeSTT(), FakeTTS()
+    server.engines.llm = make_orchestrator(
+        ScriptedBackend(["One moment. ", BOOK_CALL], ["You're booked."]), bookings=bookings())
+    client = TestClient(server.app)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "text", "text": "yes, book it"})
+        msgs = _drain(ws)
+    booking = next(m for m in msgs if m["type"] == "booking")["booking"]
+    assert booking["booking_id"].startswith("TD-") and booking["phone_last4"] == "3210"
+    spoken = " ".join(m["text"] for m in msgs if m["type"] == "audio_chunk")
+    assert "action" not in spoken and "You're booked." in spoken
+    assert client.get("/bookings").status_code == 404            # ADMIN_TOKEN not set
+
+
 def test_text_turn_and_health():
     _install_fakes(("Hello there. ", "How can I help?"))
     client = TestClient(server.app)

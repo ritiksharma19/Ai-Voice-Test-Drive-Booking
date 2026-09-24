@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import tempfile
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from booking import BookingService
 from config.settings import Settings
 from core.chunker import SpeechChunker
 from core.lang import detect_language, script_language
@@ -24,7 +27,8 @@ def base_settings(**overrides) -> Settings:
     s = Settings()
     defaults = dict(llm_provider="fake", llm_fallbacks=[], web_search_enabled=False,
                     gcp_project_id="", gcp_data_store_id="", retrieval_mode="auto",
-                    llm_first_token_timeout=0.3)
+                    kb_provider="off", llm_first_token_timeout=0.3,
+                    booking_db_path=str(Path(tempfile.mkdtemp()) / "bookings.db"))
     defaults.update(overrides)
     return replace(s, **defaults)
 
@@ -108,7 +112,7 @@ def test_retrieval_plan():
     assert no_kb.plan("gold price today") == ("web",)
     assert no_kb.plan("आज सोने का भाव") == ("web",)
     with_kb = RetrievalService(base_settings(web_search_enabled=True, gcp_project_id="p",
-                                             gcp_data_store_id="d"))
+                                             gcp_data_store_id="d", kb_provider="auto"))
     assert with_kb.plan("What is our refund policy?") == ("kb", "web")
     assert with_kb.plan("हमारी रिफंड नीति क्या है?") == ()       # KB is English-only by default
     off = RetrievalService(base_settings(retrieval_mode="off", web_search_enabled=True))
@@ -132,10 +136,14 @@ class FakeBackend(LLMBackend):
             yield t
 
 
-def make_orchestrator(*backends) -> LLMOrchestrator:
+def make_orchestrator(*backends, settings: Settings | None = None,
+                      retrieval: RetrievalService | None = None,
+                      bookings: BookingService | None = None) -> LLMOrchestrator:
     orch = LLMOrchestrator.__new__(LLMOrchestrator)
-    orch.s = base_settings()
-    orch.retrieval = RetrievalService(orch.s)
+    orch.s = settings or base_settings()
+    orch.retrieval = retrieval or RetrievalService(orch.s)
+    orch.bookings = bookings or BookingService(orch.s)
+    orch.booking_turns = {}
     orch.backends = list(backends)
     orch._cooldown_until = {}
     orch._sem = asyncio.Semaphore(4)

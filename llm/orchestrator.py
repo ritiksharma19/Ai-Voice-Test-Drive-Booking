@@ -1,17 +1,23 @@
 """
 llm/orchestrator.py
-LLMOrchestrator — turns a user utterance into a low-latency text stream.
+LLMOrchestrator — turns a customer utterance into a low-latency text stream.
 
   • Provider chain (LLM_PROVIDER + LLM_FALLBACKS) across Gemini, OpenAI,
     Anthropic and Ollama. Fails over when a provider errors or does not
     produce a first token within LLM_FIRST_TOKEN_TIMEOUT. A provider that
     just failed is skipped for a short cool-down so later turns don't pay
     the same timeout again.
-  • Retrieval is started only when the query needs it and is awaited for at
-    most LLM_RETRIEVAL_WAIT seconds.
+  • Retrieval: knowledge base first, Google second (llm/retrieval.py). If a
+    web lookup is still running after RETRIEVAL_FILLER_AFTER seconds, a short
+    "let me check" is spoken in the customer's language so the line never
+    goes silent.
+  • Booking: the model calls check_availability / book_appointment with an
+    <action> tag (booking/actions.py). The server validates and runs it, feeds
+    the [ACTION RESULT] back, and the model speaks the outcome — at most
+    _MAX_ACTION_ROUNDS actions per customer turn.
   • Bounded concurrency across all sessions (LLM_MAX_CONCURRENCY).
   • Per-session history trimmed by turns and characters; partial replies
-    are kept when the user barges in, so the model knows what was said.
+    are kept when the customer barges in, so the model knows what was said.
 """
 from __future__ import annotations
 
@@ -20,42 +26,21 @@ import time
 from collections import OrderedDict
 from typing import AsyncIterator
 
+from booking import ActionFilter, BookingService, looks_like_booking
 from config.logging_config import get_logger
 from config.settings import Settings, get_settings
-from core.lang import LANGUAGE_NAMES
 from core.metrics import TurnTimer
 from llm.base import LLMBackend
+from llm.prompts import FILLERS, build_action_result, build_system_prompt, build_user_message
 from llm.providers import build_backend
 from llm.retrieval import RetrievalService
 
 logger = get_logger("llm.orchestrator")
 
-_SYSTEM_PROMPT = """\
-You are VoiceAgent, a professional real-time voice assistant.
-
-VOICE OUTPUT RULES — your text is spoken aloud by a TTS engine:
-- No markdown, asterisks, bullet points, lists, URLs, emojis or special formatting.
-- Natural spoken sentences only. Keep answers to one to four short sentences unless the user asks for more detail.
-- Start with the answer itself; no filler such as "Great question".
-- Write numbers, units and symbols the way they are spoken ("percent", not "%").
-
-KNOWLEDGE:
-- When the user message includes retrieved context, rely on it for facts and figures.
-- Otherwise answer from your own knowledge; if unsure, say so briefly and still help.
-- Never mention retrieval systems, knowledge bases, search engines or tools.
-
-TONE: warm, calm and professional; mirror the user's mood (empathetic when they are upset, upbeat when they are happy).
-
-LANGUAGE: Reply ONLY in {lang_name}."""
-
-_CONTEXT_TEMPLATE = """\
-[Context — {label}]
-{context}
-
-[User]: {query}"""
-
 _COOLDOWN_S = 20.0
 _MAX_SESSIONS = 5000
+_MAX_ACTION_ROUNDS = 2          # e.g. check_availability, then book_appointment
+_BOOKING_IDLE_TURNS = 6         # booking mode ends after this many turns without booking talk
 
 
 class AllProvidersFailed(RuntimeError):
@@ -64,9 +49,11 @@ class AllProvidersFailed(RuntimeError):
 
 class LLMOrchestrator:
     def __init__(self, settings: Settings | None = None,
-                 retrieval: RetrievalService | None = None) -> None:
+                 retrieval: RetrievalService | None = None,
+                 bookings: BookingService | None = None) -> None:
         self.s = settings or get_settings()
         self.retrieval = retrieval or RetrievalService(self.s)
+        self.bookings = bookings or BookingService(self.s)
         self.backends: list[LLMBackend] = []
         for name in self.s.llm_chain():
             backend = build_backend(name, self.s)
@@ -81,6 +68,7 @@ class LLMOrchestrator:
         self._cooldown_until: dict[str, float] = {}
         self._sem = asyncio.Semaphore(self.s.llm_max_concurrency)
         self.conversations: OrderedDict[str, list[dict]] = OrderedDict()
+        self.booking_turns: dict[str, int] = {}   # session → turns left in booking mode
         logger.info("LLM chain: %s", " → ".join(b.describe() for b in self.backends))
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -110,7 +98,8 @@ class LLMOrchestrator:
         if hist is None:
             hist = self.conversations[session_id] = []
             while len(self.conversations) > _MAX_SESSIONS:
-                self.conversations.popitem(last=False)
+                old, _ = self.conversations.popitem(last=False)
+                self.booking_turns.pop(old, None)
         else:
             self.conversations.move_to_end(session_id)
         return hist
@@ -127,6 +116,16 @@ class LLMOrchestrator:
 
     def release_session(self, session_id: str) -> None:
         self.conversations.pop(session_id, None)
+        self.booking_turns.pop(session_id, None)
+
+    def _booking_active(self, session_id: str, user_text: str) -> bool:
+        if looks_like_booking(user_text):
+            self.booking_turns[session_id] = _BOOKING_IDLE_TURNS
+        left = self.booking_turns.get(session_id, 0)
+        if left <= 0:
+            return False
+        self.booking_turns[session_id] = left - 1
+        return True
 
     # ── main entry point ──────────────────────────────────────────────────────
 
@@ -137,34 +136,84 @@ class LLMOrchestrator:
         language: str = "en",
         timer: TurnTimer | None = None,
     ) -> AsyncIterator[dict]:
-        """Yield {"text": str, "source": "kb"|"web"|"none", "provider": str} chunks."""
+        """Yield {"text", "source", "provider"} chunks, plus {"booking": {...}}
+        once when a booking is confirmed."""
         timer = timer or TurnTimer()
         history = list(self._history(session_id))
         self._append(session_id, "user", user_text)
 
-        retrieval = await self.retrieval.get_context(user_text, wait=self.s.retrieval_wait)
-        timer.mark("retrieval_done")
-        source, context = retrieval["source"], retrieval["context"]
-
-        final_user = user_text
-        if context:
-            label = "company knowledge base" if source == "kb" else "live web results"
-            final_user = _CONTEXT_TEMPLATE.format(label=label, context=context, query=user_text)
-        messages = [*history, {"role": "user", "content": final_user}]
-        system = _SYSTEM_PROMPT.format(lang_name=LANGUAGE_NAMES.get(language, language))
-
-        reply: list[str] = []
+        sources = self.retrieval.plan(user_text, self._booking_active(session_id, user_text))
+        spoken: list[str] = []          # text of the current round, for history
+        retrieval = asyncio.create_task(
+            self.retrieval.get_context(user_text, self.s.retrieval_wait, sources))
         try:
-            async with self._sem:
-                async for provider, text in self._stream_with_failover(system, messages):
-                    if not reply:
-                        timer.mark("llm_ttft")
-                    reply.append(text)
-                    yield {"text": text, "source": source, "provider": provider}
+            if "web" in sources:
+                done, _ = await asyncio.wait({retrieval}, timeout=self.s.retrieval_filler_after)
+                if not done:
+                    filler = FILLERS.get(language, FILLERS["en"])
+                    timer.mark("filler")
+                    spoken.append(filler + " ")
+                    yield {"text": filler + " ", "source": "none", "provider": "filler"}
+            found = await retrieval
+        finally:
+            if not retrieval.done():
+                retrieval.cancel()
+        timer.mark("retrieval_done")
+        source = found["source"]
+
+        messages = [*history, {"role": "user", "content":
+                               build_user_message(user_text, source, found["context"])}]
+        system = build_system_prompt(self.s, language, self.bookings.now())
+
+        llm_started = False
+        provider = ""
+        try:
+            for round_no in range(_MAX_ACTION_ROUNDS + 1):
+                action_filter = ActionFilter()
+                async with self._sem:
+                    async for provider, text in self._stream_with_failover(system, messages):
+                        if not llm_started:
+                            timer.mark("llm_ttft")
+                            llm_started = True
+                        say = action_filter.feed(text)
+                        if say:
+                            spoken.append(say)
+                            yield {"text": say, "source": source, "provider": provider}
+                say = action_filter.flush()
+                if say:
+                    spoken.append(say)
+                    yield {"text": say, "source": source, "provider": provider}
+
+                if not action_filter.called:
+                    break
+                if round_no == _MAX_ACTION_ROUNDS:
+                    logger.warning("Action limit reached in one turn — ignoring %s",
+                                   action_filter.raw_tag[:80])
+                    break
+
+                action = action_filter.action or {}
+                result = (await self.bookings.execute(action, session_id, language) if action
+                          else {"status": "error", "error": "invalid_action_format",
+                                "message": "The action tag must contain valid JSON."})
+                logger.info("Action %s → %s", action.get("name", "?"), result.get("status"))
+                timer.mark(f"action_{round_no + 1}")
+                if result.get("status") == "confirmed":
+                    self.booking_turns.pop(session_id, None)
+                    if not result.get("already_booked"):
+                        yield {"text": "", "source": source, "provider": "booking",
+                               "booking": result}
+
+                call = "".join(spoken) + action_filter.raw_tag
+                spoken.clear()
+                result_msg = build_action_result(result)
+                self._append(session_id, "assistant", call)
+                self._append(session_id, "user", result_msg)
+                messages += [{"role": "assistant", "content": call},
+                             {"role": "user", "content": result_msg}]
         finally:
             # Also runs on barge-in (cancellation): keep what was actually said.
-            if reply:
-                self._append(session_id, "assistant", "".join(reply))
+            if spoken:
+                self._append(session_id, "assistant", "".join(spoken))
 
     async def _stream_with_failover(self, system: str, messages: list[dict]
                                     ) -> AsyncIterator[tuple[str, str]]:

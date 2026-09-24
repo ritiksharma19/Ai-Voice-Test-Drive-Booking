@@ -21,6 +21,7 @@ let currentAssistantText = "";
 let audioQueue = [];
 let isPlayingAudioQueue = false;
 let selectedVoiceName = "";
+let businessLabel = "VoiceAgent";   // replaced by "<agent> · <business>" from /config
 
 // ── Listening / recording ──────────────────────────────────────────────────
 let isListeningEnabled = false;
@@ -101,6 +102,11 @@ async function fetchClientConfig() {
         if (!res.ok) return;
         const cfg = await res.json();
         if (Number.isFinite(cfg.vad_silence_ms)) silenceMs = cfg.vad_silence_ms;
+        if (cfg.agent_name && cfg.business_name) {
+            businessLabel = `${cfg.agent_name} · ${cfg.business_name}`;
+            const h = document.querySelector("#welcome-msg h3");
+            if (h) h.textContent = `Hi, I'm ${cfg.agent_name} from ${cfg.business_name}`;
+        }
     } catch (_) { /* keep default */ }
 }
 
@@ -193,6 +199,9 @@ function setupWebSocket() {
             if (audioQueue.length === 0 && !isPlayingAudioQueue) {
                 finishSpeakingCycle();
             }
+
+        } else if (data.type === "booking") {
+            appendBookingCard(data.booking);
 
         } else if (data.type === "error") {
             setUIState(isListeningEnabled ? "listening" : "idle");
@@ -738,7 +747,7 @@ function prepareAssistantBubble() {
     currentAssistantBubble.className = "agent-msg";
     currentAssistantBubble.innerHTML = `
         <div class="agent-header">
-            <span class="msg-label">VoiceAgent</span>
+            <span class="msg-label">${escapeHTML(businessLabel)}</span>
             <span id="latest-assistant-source" class="src-badge" style="display:none"></span>
         </div>
         <div id="latest-assistant-response" class="agent-text">
@@ -771,6 +780,26 @@ function setAssistantSource(source) {
     badge.textContent = labels[source] || source;
     badge.className = `src-badge ${source}`;
     badge.style.display = "inline";
+}
+
+function appendBookingCard(b) {
+    if (!b) return;
+    const kind = b.kind === "meeting" ? "Sales meeting" : "Test drive";
+    const rows = [
+        ["Car", b.car_model], ["Showroom", b.showroom],
+        ["When", `${b.weekday}, ${b.date} at ${b.time}`], ["Name", b.customer_name],
+        ["Mobile", b.phone_last4 ? `•••••• ${b.phone_last4}` : ""],
+    ].filter(([, v]) => v);
+    const el = document.createElement("div");
+    el.className = "booking-card";
+    el.innerHTML = `
+        <div class="booking-head">
+            <span><i class="fa-regular fa-calendar-check"></i> ${kind} confirmed</span>
+            <span class="booking-id">${escapeHTML(b.booking_id || "")}</span>
+        </div>
+        <dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHTML(String(v))}</dd>`).join("")}</dl>`;
+    chatContainer.appendChild(el);
+    scrollToBottom();
 }
 
 function appendSystemMessage(text) {

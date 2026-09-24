@@ -1,68 +1,159 @@
 # VoiceAgent
 
-**A real-time multilingual voice assistant. Speak English or any of nine Indian languages and get a spoken reply. It runs GPU-first on Windows or Linux, with the LLM, STT and TTS providers you choose.**
+**A real-time, multilingual voice agent for car dealerships. Customers ask about cars and book test drives or sales meetings by talking, in English or any of nine Indian languages.**
 
-A browser streams your voice to a FastAPI server over one WebSocket. Speech is transcribed on your NVIDIA GPU with Whisper (or by a cloud STT). The server streams an answer from Gemini, OpenAI, Anthropic Claude or a local Ollama model and speaks it back sentence by sentence while the LLM is still generating.
+A customer opens the dealership's website and talks. VoiceAgent answers questions about the cars (price, variants, mileage, EV range, features, finance, warranty) from the dealership's own **knowledge base**. If the knowledge base has no answer, it searches **Google**. When the customer is ready, it books a **test drive** or a **sales meeting**: it collects the details, checks the slot, saves the booking and reads back a booking ID.
 
+- **Knowledge base first, Google second:** answers come from the dealership's verified data; only questions it can't answer go to Google Search
+- **Bookings by voice:** test drives and sales meetings with real slot capacity, validation (mobile number, model, showroom, opening hours), no double-booking, SQLite storage and an optional CRM webhook
+- **CO-STAR prompt engineering:** a structured system prompt tuned for voice selling, with few-shot examples and guardrails against invented prices or fake bookings ([details](#prompt-engineering-co-star))
 - **Languages:** English, Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi
-- **Barge-in:** start talking and the bot stops at once; in-flight LLM and TTS work is cancelled
-- **Provider failover:** if the primary LLM errors or is slow to start, the next one in the chain answers
-- **Live data when it matters:** web search runs only for real-time questions (prices, weather, news); an optional knowledge base comes from Google Discovery Engine
+- **Barge-in:** start talking and the agent stops at once; in-flight LLM and TTS work is cancelled
+- **Provider failover:** Gemini, OpenAI, Claude or a local Ollama model; if one fails or is slow, the next one answers
 - **Built-in latency telemetry:** per-turn stage timings, a `/metrics` endpoint and a benchmark tool
+
+The repository ships with a **sample fictional dealership** (Aurora Motors, Pune, four models) so it works out of the box. Replace the files in `data/knowledge_base/` and the business settings in `.env` with your own ([Customising for your dealership](#customising-for-your-dealership)).
 
 ---
 
 ## Contents
 
 1. [Architecture](#architecture)
-2. [Requirements](#requirements)
-3. [Installation (Windows + NVIDIA GPU)](#installation-windows--nvidia-gpu)
-4. [Configuration (.env)](#configuration-env)
-5. [Providers and model selection guide](#providers-and-model-selection-guide)
-6. [Cost](#cost)
-7. [Usage](#usage)
-8. [Performance and latency](#performance-and-latency)
-9. [Benchmarking](#benchmarking)
-10. [Production deployment](#production-deployment)
-11. [Troubleshooting](#troubleshooting)
-12. [Project structure](#project-structure)
+2. [How the dealership agent works](#how-the-dealership-agent-works)
+3. [Requirements](#requirements)
+4. [Installation (Windows + NVIDIA GPU)](#installation-windows--nvidia-gpu)
+5. [Configuration (.env)](#configuration-env)
+6. [Providers and model selection guide](#providers-and-model-selection-guide)
+7. [Cost](#cost)
+8. [Usage](#usage)
+9. [Performance and latency](#performance-and-latency)
+10. [Benchmarking](#benchmarking)
+11. [Production deployment](#production-deployment)
+12. [Troubleshooting](#troubleshooting)
+13. [Project structure](#project-structure)
 
 ---
 
 ## Architecture
 
-```
-Browser (mic) ── 16 kHz PCM WAV over WebSocket ──►  FastAPI /ws
-                                                        │
-                    ┌───────────────────────────────────┘
-                    ▼
-        STT  (faster-whisper on CUDA │ Sarvam Saaras │ OpenAI │ Indic-Seamless)
-          Silero VAD trims silence · language ID restricted to STT_LANGUAGES
-                    │ text + language
-                    ▼
-        Language ID (script-based, Lingua for Hindi vs Marathi)
-                    │
-                    ▼
-        Retrieval planner ── conversational / general → none (answer immediately)
-                    │       └ real-time (price, weather, news…) → web search race
-                    │       └ KB configured → Discovery Engine ∥ web, first quality hit
-                    │  (waits at most LLM_RETRIEVAL_WAIT; results cached)
-                    ▼
-        LLM chain  (Gemini → OpenAI → Anthropic → Ollama, configurable)
-          streaming · first-token timeout · failover · cool-down · bounded concurrency
-                    │ text deltas
-                    ▼
-        Speech chunker: first clause ASAP, then whole sentences
-                    │
-                    ▼
-        TTS router  (Sarvam Bulbul │ ElevenLabs Flash │ OpenAI │ Edge fallback)
-          concurrent synthesis · strict in-order delivery · LRU cache
-                    │ base64 MP3 chunks
-                    ▼
-Browser (speaker) — plays each chunk as it arrives
+```mermaid
+flowchart TD
+    MIC["Browser microphone"] -->|"16 kHz PCM WAV over WebSocket"| STT
+    STT["Speech-to-text<br/>Whisper on GPU · Sarvam · OpenAI · Indic-Seamless"] --> LID["Language ID<br/>script-based, 10 languages"]
+    LID --> PLAN{"Retrieval plan"}
+    PLAN -->|"small talk, phone number"| LLM
+    PLAN -->|"car or dealership question"| KB["Knowledge base<br/>local Markdown or Discovery Engine"]
+    PLAN -->|"live question not about us"| WEB
+    KB -->|"answer found"| LLM
+    KB -->|"no answer"| WEB["Google Search<br/>Gemini grounding → Brave → scrapers"]
+    WEB --> LLM["LLM with CO-STAR prompt<br/>Gemini → OpenAI → Claude → Ollama"]
+    LLM -->|"#lt;action#gt; tag"| BOOK["Booking service<br/>validate · slot check · SQLite · webhook"]
+    BOOK -->|"ACTION RESULT"| LLM
+    LLM -->|"spoken text only"| CHUNK["Speech chunker<br/>first clause first"]
+    CHUNK --> TTS["Text-to-speech<br/>Sarvam · ElevenLabs · OpenAI · Edge"]
+    TTS -->|"MP3 chunks, in order"| SPK["Browser speaker"]
+    BOOK -.->|"booking card"| SPK
 ```
 
 Each user turn runs as its own `asyncio.Task`, so a barge-in cancels it immediately. All network I/O is async over pooled keep-alive connections. Local GPU inference runs in a worker thread, so the event loop never blocks.
+
+---
+
+## How the dealership agent works
+
+### Knowledge base first, Google second
+
+Every question is routed before the LLM starts:
+
+| Question | Route | Example |
+|---|---|---|
+| Small talk, or a turn containing a phone number or email | No lookup (contact details never go to a search engine) | "Thanks!", "my number is 98765 43210" |
+| About our cars or dealership | **Knowledge base** → Google only if the KB has no answer | "What's the range of the Ion?", "current offers on the Ridge?" |
+| Time-sensitive and not about us | **Google** directly | "Petrol price today in Pune" |
+| Anything else | **Knowledge base** → Google | "Who won the cricket world cup?" |
+| During a booking (name, date, showroom) | Knowledge base only, never the web | "Rohan Mehta", "Saturday at 11" |
+
+**What counts as "the KB has an answer":** the local knowledge base is searched with BM25. A result counts only when the best-matching sections contain at least `KB_MIN_COVERAGE` (50 %) of the question's meaningful words. So "What is the price of the Ion?" is answered from the catalog. "Who won the cricket world cup?" matches nothing, so it goes to Google. Hinglish words (kimat, daam, gaadi, average) are mapped to catalog terms.
+
+**Google Search** is done with Gemini's grounding tool (`GEMINI_API_KEY`). Google's Custom Search JSON API is closed to new customers and shuts down on 1 January 2027, so grounding is the supported way to query Google from code. If it fails, Brave Search (if configured) and then the free DuckDuckGo/Bing scrapers are tried. If a web lookup takes longer than `RETRIEVAL_FILLER_AFTER` (0.7 s), the agent says "Let me check that for you" in the customer's language so the line never goes silent.
+
+### Booking a test drive or sales meeting
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant A as Voice agent (LLM)
+    participant B as Booking service
+    participant D as SQLite + CRM webhook
+    C->>A: "Test drive of the Ridge on Saturday at 11 at Baner"
+    A->>C: Asks for name and mobile number
+    C->>A: "Rohan Mehta, 98765 43210"
+    A->>C: Reads the details back, digit by digit
+    C->>A: "Yes"
+    A->>B: #lt;action#gt; book_appointment {...} (never spoken)
+    B->>B: Validate mobile, model, showroom, slot, opening hours
+    alt slot free
+        B->>D: Insert booking, POST to webhook
+        B-->>A: ACTION RESULT confirmed, ID TD-7KQ3M
+        A->>C: "You're booked… your ID is T D seven K Q three M"
+    else slot full or invalid field
+        B-->>A: ACTION RESULT error + 3 alternative slots
+        A->>C: Offers the alternatives or re-asks the one wrong field
+    end
+```
+
+- **Actions, not native tool calls.** The model calls `check_availability` or `book_appointment` by writing an `<action>{json}</action>` tag. This works the same on Gemini, OpenAI, Claude and local Ollama models, keeps streaming and failover, and is fully testable offline. The tag is filtered out of the audio as it streams. The server runs the action and feeds an `[ACTION RESULT]` back, and the model then speaks the outcome (at most 2 actions per turn).
+- **The server validates, not the LLM:**
+  - a 10-digit Indian mobile number, where Hindi or other Indic digits such as ९८७ are accepted
+  - a model you sell ("the ridge" → Aurora Ridge; "Tata Nexon" is rejected)
+  - a known showroom, fuzzy-matched ("viman nagar")
+  - a future slot inside opening hours, at least `BOOKING_MIN_LEAD_MINUTES` ahead and within `BOOKING_MAX_DAYS_AHEAD`
+
+  All invalid fields are reported at once, so the agent asks only for what's wrong.
+- **Capacity:** `TEST_DRIVE_CAPACITY` and `MEETING_CAPACITY` bookings per slot per showroom. A full slot returns the three nearest free slots. The capacity check and the insert run under one lock, so two customers can't take the last seat. Repeating the same booking returns the existing ID instead of a duplicate.
+- **Where bookings go:** `data/bookings.db` (SQLite, git-ignored because it holds phone numbers). Optionally every new booking is POSTed as JSON to `BOOKING_WEBHOOK_URL`, which can be your CRM, Zapier or Make, or a Google Apps Script that appends a row to a Sheet. Staff can list bookings at `GET /bookings?date=YYYY-MM-DD` with `Authorization: Bearer <ADMIN_TOKEN>`. The endpoint is disabled unless `ADMIN_TOKEN` is set.
+- **Privacy:** phone numbers and emails are masked in logs (`******3210`), never sent to a search engine, and the browser only receives the last four digits.
+- **The browser** shows a confirmation card with the booking ID, car, showroom, date and time.
+
+### Prompt engineering (CO-STAR)
+
+The system prompt (`llm/prompts.py`) follows the **CO-STAR** framework. Each part is written for a spoken sales conversation:
+
+| Part | What it tells the model |
+|---|---|
+| **C**ontext | It is the dealership's voice assistant; the models, showrooms, opening hours; what `[KNOWLEDGE BASE]`, `[WEB RESULTS]` and `[ACTION RESULT]` mean |
+| **O**bjective | In priority order: answer correctly from the KB, never guess prices, specs or offers; answer general questions briefly; offer a test drive **once** when there is buying interest; collect booking details |
+| **S**tyle | 1–3 spoken sentences, key fact first, one question at a time, numbers as spoken ("seventeen lakh forty-nine thousand rupees ex-showroom"), jargon explained |
+| **T**one | Warm, confident, never pushy; calm with confused or annoyed customers |
+| **A**udience | Indian car buyers, often non-experts, often mixing languages, possibly on a phone in a noisy place |
+| **R**esponse | Plain text only (it is spoken), reply only in the customer's language, never mention internal systems, never ask for OTP, Aadhaar, PAN or card details |
+
+It adds a **BOOKING** section with the exact action format, a rule to read details back before booking, and "never claim a booking the system did not confirm". **Few-shot examples** cover a KB price answer, an honest "I don't have that detail" fallback, and a full booking with its action and result. A **14-day calendar** (`Sat 26 Sep 2026 = 2026-09-26`) turns "next Saturday" into a lookup rather than date arithmetic, which LLMs often get wrong. The dated parts (the example booking and the calendar) sit at the end of the prompt, so the first ~1,200 tokens are identical on every call and can be served from the provider's prompt cache.
+
+### Tuning, and why this isn't weight fine-tuning
+
+The agent is tuned for the business **without fine-tuning model weights**, on purpose:
+
+- **Prices, offers and stock change monthly.** Fine-tuned knowledge goes stale and can't be updated without retraining. Retrieval from the knowledge base is always current, so you just edit a Markdown file.
+- **Failover needs interchangeable models.** A fine-tuned model exists on one provider only; the prompt works unchanged on Gemini, GPT, Claude and Ollama.
+- **Hallucinated prices are the main risk.** Fine-tuning makes a model sound confident about facts it half-learned. Grounding it in retrieved text, with server-side validation for bookings, is safer.
+
+What is tuned instead:
+- **The prompt:** CO-STAR, few-shot examples and guardrails.
+- **Retrieval:** KB-first routing, the coverage threshold, Hinglish synonyms, and a time-sensitive-question rule so "petrol price today" doesn't return car prices.
+- **Generation:** `LLM_MAX_TOKENS=400`; minimal thinking or reasoning for low latency; `LLM_TEMPERATURE=0.3` on Ollama. Cloud reasoning models such as Sonnet 5, Opus 5 and GPT-6 reject sampling parameters, so they aren't set there.
+- **Speech:** first-clause chunking and a spoken filler during web lookups.
+
+Fine-tuning becomes worth it once you have **thousands of real, reviewed transcripts** and want a fixed house style or a smaller, cheaper local model. Train style and flow only, and keep facts in the knowledge base.
+
+### Customising for your dealership
+
+1. **Knowledge base:** replace the Markdown files in `data/knowledge_base/`. Use one `###` heading per topic and repeat the model name in the heading ("### Aurora Ion price and variants"). The files are indexed at startup. For a large catalog or PDFs, use Google Discovery Engine instead (`GCP_PROJECT_ID`, `GCP_DATA_STORE_ID`).
+2. **Business settings** in `.env`: `BUSINESS_NAME`, `BUSINESS_CITY`, `AGENT_NAME`, `SHOWROOMS`, `CAR_MODELS`, `BUSINESS_HOURS`, `BUSINESS_DAYS`, `BUSINESS_TIMEZONE`.
+3. **Booking rules:** slot length, capacity per slot, lead time and how many days ahead customers can book.
+4. **CRM:** set `BOOKING_WEBHOOK_URL` to receive every booking as JSON.
+5. **Voice:** `SARVAM_SPEAKER` or `OPENAI_TTS_VOICE` to match the agent's persona.
 
 ---
 
@@ -135,7 +226,7 @@ Everything is configured through environment variables (`.env`), and nothing is 
 
 | Variable | Used for | Get it |
 |---|---|---|
-| `GEMINI_API_KEY` | Gemini LLM | [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) |
+| `GEMINI_API_KEY` | Gemini LLM **and Google Search** (grounding) | [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) |
 | `OPENAI_API_KEY` | OpenAI LLM / STT / TTS | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | `ANTHROPIC_API_KEY` | Claude LLM | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
 | `SARVAM_API_KEY` | Indic TTS (Bulbul) / STT (Saaras) | [dashboard.sarvam.ai](https://dashboard.sarvam.ai) |
@@ -151,8 +242,36 @@ Everything is configured through environment variables (`.env`), and nothing is 
 | `STT_PROVIDER` | `whisper` · `sarvam` · `openai` · `seamless` | `whisper` |
 | `TTS_PROVIDER` | `auto` · `sarvam` · `elevenlabs` · `openai` · `edge` | `auto` |
 | `RETRIEVAL_MODE` | `auto` · `always` · `off` | `auto` |
+| `KB_PROVIDER` | `auto` (Discovery Engine if `GCP_*` set, else local files) · `local` · `discovery` · `off` | `auto` |
+| `WEB_SEARCH_PROVIDER` | `auto` (Google → Brave → scrapers) · `google` · `brave` · `scrape` | `auto` |
 
-Providers without a key are skipped with a warning. Edge TTS needs no key and is always the last TTS fallback.
+Providers without a key are skipped with a warning. Edge TTS needs no key and is always the last TTS fallback. Web search falls back to the free scrapers when neither Google nor Brave is available.
+
+### Business and bookings
+
+| Variable | Default | Notes |
+|---|---|---|
+| `BUSINESS_NAME` / `BUSINESS_CITY` / `AGENT_NAME` | `Aurora Motors` / `Pune` / `Priya` | Used in the prompt and the UI greeting |
+| `SHOWROOMS` | `Baner Showroom;Viman Nagar Showroom` | `;`-separated; bookings are fuzzy-matched to these |
+| `CAR_MODELS` | the four sample models | `,`-separated; test drives only for these (empty = accept any) |
+| `BUSINESS_HOURS` / `BUSINESS_DAYS` / `BUSINESS_TIMEZONE` | `10:00-19:00` / all week / `Asia/Kolkata` | The last slot starts one slot before closing |
+| `BOOKING_SLOT_MINUTES` | `60` | Slot length |
+| `TEST_DRIVE_CAPACITY` / `MEETING_CAPACITY` | `2` / `2` | Bookings per slot per showroom (cars / consultants available) |
+| `BOOKING_MIN_LEAD_MINUTES` / `BOOKING_MAX_DAYS_AHEAD` | `60` / `30` | Booking window |
+| `BOOKING_DB_PATH` | `data/bookings.db` | SQLite file (git-ignored) |
+| `BOOKING_WEBHOOK_URL` | — | Receives every new booking as JSON (`event: booking.created`) |
+| `ADMIN_TOKEN` | — | Enables `GET /bookings` for staff |
+
+### Knowledge base and web search
+
+| Variable | Default | Notes |
+|---|---|---|
+| `KB_DIR` | `data/knowledge_base` | Markdown / text files, indexed at startup |
+| `KB_MIN_COVERAGE` | `0.5` | Share of the question's words the KB must match to count as an answer; raise it to send more questions to Google |
+| `GOOGLE_SEARCH_MODEL` / `SEARCH_REGION` | `gemini-3.5-flash-lite` / `India` | Model used for Google grounding, and the market it focuses on |
+| `LLM_RETRIEVAL_WAIT` | `3` s | Longest the answer waits for KB + Google (the KB alone takes < 1 ms) |
+| `RETRIEVAL_FILLER_AFTER` | `0.7` s | Say "let me check" if a web lookup is still running |
+| `GCP_PROJECT_ID` / `GCP_DATA_STORE_ID` | — | Google Discovery Engine instead of the local files |
 
 ### Models and tuning
 
@@ -168,8 +287,8 @@ Providers without a key are skipped with a warning. Edge TTS needs no key and is
 | `STT_LANGUAGE` | *(empty)* | Force one language (e.g. `hi`) to skip language detection |
 | `STT_LANGUAGES` | all 10 | Whisper's language ID is restricted to these (Urdu → Hindi, etc.) |
 | `LLM_MAX_TOKENS` | `400` | Spoken replies are short; caps cost and runaway answers |
+| `LLM_TEMPERATURE` | `0.3` | Ollama only; cloud reasoning models reject or ignore sampling parameters |
 | `LLM_FIRST_TOKEN_TIMEOUT` | `6` s | Fail over if no token arrives in time |
-| `LLM_RETRIEVAL_WAIT` | `1.2` s | Longest the answer waits for web/KB context |
 | `TTS_FIRST_CHUNK_MIN_CHARS` / `_MAX_CHARS` | `24` / `70` | How early the first audio is cut |
 | `VAD_SILENCE_MS` | `550` | Browser end-of-speech pause (sent to the client via `/config`) |
 
@@ -203,7 +322,7 @@ These recommendations were researched in September 2026 against each provider's 
 |---|---|---|
 | Intent / routing classification | Regex rules (built in, 0 ms) → `gemini-3.5-flash-lite` or `gpt-6-luna` | Don't spend an LLM call on the hot path when a rule suffices; this project routes retrieval with multilingual regexes |
 | Entity extraction (structured JSON) | `gpt-6-luna`, `gemini-3.5-flash-lite`, `claude-haiku-4-5` with structured outputs / JSON schema | Small models are accurate enough for extraction and 5–20× cheaper |
-| Embeddings (custom RAG) | `gemini-embedding-001` (text) or Gemini Embedding 2 (multimodal); `text-embedding-3-small` (cost) / `-large` (quality) | Not needed by default: the KB uses Discovery Engine's managed retrieval |
+| Embeddings (custom RAG) | `gemini-embedding-001` (text) or Gemini Embedding 2 (multimodal); `text-embedding-3-small` (cost) / `-large` (quality) | Not needed by default: the local KB uses BM25 and Discovery Engine has managed retrieval |
 | Speech-to-text, local GPU | ★ **faster-whisper `large-v3-turbo`** (float16) | Free, private, near large-v3 accuracy at a fraction of the compute |
 | Speech-to-text, Indian languages / Hinglish | **Sarvam `saaras:v3`** | Best Indic and code-mixed accuracy; cloud, ≤ 30 s per request |
 | Speech-to-text, cloud multilingual | OpenAI `gpt-4o-mini-transcribe` (or `gpt-transcribe` for accuracy) | Simple REST |
@@ -211,7 +330,7 @@ These recommendations were researched in September 2026 against each provider's 
 | Text-to-speech, lowest latency (English, Hindi, Tamil) | **ElevenLabs `eleven_flash_v2_5`** | ~75 ms model latency (vendor figure) |
 | Text-to-speech, expressive | OpenAI `gpt-4o-mini-tts` | Steerable tone via instructions |
 | Text-to-speech, free | Edge neural voices | No key needed; about 0.6 s fixed connection overhead per sentence (measured) |
-| Web search | **Brave Search API** | Official API; scrapers (DuckDuckGo + Bing, raced) are the free fallback |
+| Web search | ★ **Google via Gemini grounding** | Google's supported search API from code (Custom Search JSON API shuts down 2027-01-01); Brave Search API and free scrapers are the fallbacks |
 
 > **Speech-to-speech models** (OpenAI `gpt-realtime-2.1` / `gpt-live-1`, Gemini `gemini-3.8-live`) can go lower still by merging STT, LLM and TTS into one model. They are not wired in here, because the pipeline design keeps per-language voice control (Sarvam), retrieval and provider independence. They are the natural next step if English-first latency is all that matters.
 
@@ -225,32 +344,44 @@ List prices were checked in **September 2026** on each provider's pricing page (
 
 ### How a "turn" is estimated
 
-Per-turn costs below assume one typical voice exchange:
+Per-turn costs below assume one typical exchange with the dealership agent:
 
 | Quantity | Assumption | Why |
 |---|---|---|
-| User speech | 5 s of audio | A short spoken question |
-| LLM input | 1,200 tokens | System prompt (~300) + `HISTORY_TURNS=8` of short history (~850) + question (~50). Add ~1,000 when web/KB context is injected |
-| LLM output | 80 tokens | 1–4 spoken sentences; hard cap is `LLM_MAX_TOKENS=400` |
-| Spoken reply | 350 characters ≈ 20 s of audio | 80 tokens of text |
-| Web search | 10 % of turns | `RETRIEVAL_MODE=auto` only searches for real-time questions |
+| Customer speech | 5 s of audio | A short spoken question |
+| LLM input | 3,000 tokens | CO-STAR system prompt with examples and calendar (~1,700, measured) + short history (~850) + knowledge-base context (~250–600) + question (~50) |
+| LLM output | 100 tokens | 1–3 spoken sentences, sometimes a booking action; hard cap `LLM_MAX_TOKENS=400` |
+| LLM calls | 1.1 per turn | ~10 % of turns run a booking action, which needs a second call to speak the result |
+| Spoken reply | 350 characters ≈ 20 s of audio | 100 tokens of text |
+| Web search | 15 % of turns | Only questions the knowledge base can't answer, plus live questions like fuel prices |
+
+So the LLM figures use 3,300 input and 110 output tokens per turn. The local knowledge base and the bookings database cost nothing to run.
 
 ### LLM (per 1M tokens)
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2a78d6"}}}}%%
+xychart-beta horizontal
+    title "LLM cost per 1,000 turns (USD)"
+    x-axis ["gpt-6-luna", "gemini-3.5-flash-lite", "gemini-3.8-flash", "claude-haiku-4-5", "gpt-6-sol", "claude-sonnet-5", "claude-opus-5"]
+    y-axis "USD per 1,000 turns" 0 --> 20
+    bar [0.39, 1.27, 2.89, 3.85, 7.70, 7.70, 19.25]
+```
+
 | Model | Provider | Input | Output | Per 1,000 turns |
 |---|---|---|---|---|
-| ★ `gemini-3.5-flash-lite` | Google | $0.30 | $2.50 | **$0.56** |
-| ★ `gpt-6-luna` | OpenAI | $0.10 | $0.50 | **$0.16** |
-| `claude-haiku-4-5` | Anthropic | $1.00 | $5.00 | $1.60 |
-| `gemini-3.8-flash` | Google | $0.75 → $1.50 from 1 Jan 2027 | $3.75 → $7.50 from 1 Jan 2027 | $1.20 (→ $2.40) |
-| `gpt-6-sol` | OpenAI | $2.00 | $10.00 | $3.20 |
-| `claude-sonnet-5` | Anthropic | $2.00 | $10.00 | $3.20 |
-| `claude-opus-5` | Anthropic | $5.00 | $25.00 | $8.00 |
-| `gpt-6-astra` | OpenAI | $10.00 | $50.00 | $16.00 |
-| `claude-fable-5-1` | Anthropic | $10.00 | $50.00 | $16.00 |
+| ★ `gemini-3.5-flash-lite` | Google | $0.30 | $2.50 | **$1.27** |
+| ★ `gpt-6-luna` | OpenAI | $0.10 | $0.50 | **$0.39** |
+| `claude-haiku-4-5` | Anthropic | $1.00 | $5.00 | $3.85 |
+| `gemini-3.8-flash` | Google | $0.75 → $1.50 from 1 Jan 2027 | $3.75 → $7.50 from 1 Jan 2027 | $2.89 (→ $5.78) |
+| `gpt-6-sol` | OpenAI | $2.00 | $10.00 | $7.70 |
+| `claude-sonnet-5` | Anthropic | $2.00 | $10.00 | $7.70 |
+| `claude-opus-5` | Anthropic | $5.00 | $25.00 | $19.25 |
+| `gpt-6-astra` | OpenAI | $10.00 | $50.00 | $38.50 |
+| `claude-fable-5-1` | Anthropic | $10.00 | $50.00 | $38.50 |
 | `gemma3:12b` / `gemma3:4b` (Ollama) | local | $0 | $0 | GPU cost only (see [local GPU](#local-models-on-a-gpu)) |
 
-Thinking/reasoning tokens are billed as output. Keep `GEMINI_THINKING_LEVEL=minimal`, `OPENAI_REASONING_EFFORT=none` and `ANTHROPIC_THINKING=disabled` (Sonnet 5), or the output figures above can rise several-fold.
+Thinking/reasoning tokens are billed as output. Keep `GEMINI_THINKING_LEVEL=minimal`, `OPENAI_REASONING_EFFORT=none` and `ANTHROPIC_THINKING=disabled` (Sonnet 5), or the output figures above can rise several-fold. OpenAI and Gemini automatically cache repeated prompt prefixes of 1,024+ tokens at a discount. The prompt's ~1,200-token static prefix qualifies, so real input cost can be lower than shown.
 
 ### Speech-to-text
 
@@ -271,28 +402,45 @@ Thinking/reasoning tokens are billed as output. Keep `GEMINI_THINKING_LEVEL=mini
 | ★ `bulbul:v3` | Sarvam | ₹3 / 1,000 characters (≈ $0.034) | ₹1,050 ≈ $11.90 |
 | `eleven_flash_v2_5` | ElevenLabs | $0.05 / 1,000 characters | $17.50 |
 
-**TTS is usually the largest cost in the pipeline**: a paid voice costs 10–100× more per turn than a fast LLM. The ElevenLabs figure is the API usage rate; subscription plans bundle characters differently.
+The ElevenLabs figure is the API usage rate; subscription plans bundle characters differently.
 
-### Retrieval
+### Knowledge base and web search
 
 | Service | Price | Per 1,000 turns |
 |---|---|---|
-| DuckDuckGo + Bing scraping (fallback) | Free, best-effort | $0 |
-| Brave Search API | $5 / 1,000 requests ($5 of monthly credit included) | ≈ $0.50 at 10 % of turns |
-| Google Discovery Engine (KB) | Per-query and storage pricing on [Google Cloud](https://cloud.google.com/generative-ai-app-builder/pricing) | Depends on data store size |
+| Local knowledge base (`data/knowledge_base`) | Free, runs in-process | $0 |
+| ★ Google Search via Gemini grounding | 5,000 searches / month free, then $14 / 1,000 searches, + the grounding call's tokens (~$0.0005 each on Flash-Lite) | ≈ $2.20 at 15 % of turns |
+| Brave Search API | $5 / 1,000 requests ($5 of monthly credit included) | ≈ $0.75 at 15 % of turns |
+| DuckDuckGo + Bing scraping (last fallback) | Free, best-effort | $0 |
+| Google Discovery Engine (KB alternative) | Per-query and storage pricing on [Google Cloud](https://cloud.google.com/generative-ai-app-builder/pricing) | Depends on data store size |
+
+Gemini 3 bills grounding per search query the model actually runs; the estimate assumes one query per lookup. The free 5,000 searches cover about 33,000 turns a month at a 15 % web rate.
+
+### Where the money goes
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2a78d6"}}}}%%
+xychart-beta horizontal
+    title "Default Indian-language stack: cost per 1,000 turns by stage (USD)"
+    x-axis ["Speech-to-text (Whisper, rented RTX 4090)", "LLM (gemini-3.5-flash-lite)", "Google Search (15% of turns)", "Text-to-speech (Sarvam bulbul:v3)"]
+    y-axis "USD per 1,000 turns" 0 --> 12
+    bar [0.07, 1.27, 2.20, 11.90]
+```
+
+**Speech output is the largest cost**: a paid voice costs about 10× the LLM per turn. Edge TTS is free, so on the English default stack Google Search becomes the largest item.
 
 ### Example stacks (per 1,000 turns)
 
 | Stack | STT | LLM | TTS | Search | **Total** | ≈ per turn |
 |---|---|---|---|---|---|---|
-| Default, English (Whisper on GPU + Flash-Lite + Edge) | GPU | $0.56 | $0 | $0.50 | **$1.06** + GPU | $0.001 |
-| Default, Indic (Whisper on GPU + Flash-Lite + Sarvam) | GPU | $0.56 | $11.90 | $0.50 | **$12.96** + GPU | $0.013 |
-| All-cloud, cheapest (OpenAI mini STT + Luna + Edge) | $0.25 | $0.16 | $0 | $0.50 | **$0.91** | $0.001 |
-| All-cloud, Indic quality (Saaras + Flash-Lite + Bulbul) | $0.47 | $0.56 | $11.90 | $0.50 | **$13.43** | $0.013 |
-| Low-latency English (OpenAI mini STT + Haiku + ElevenLabs Flash) | $0.25 | $1.60 | $17.50 | $0.50 | **$19.85** | $0.020 |
-| Fully local (Whisper + Ollama `gemma3:12b` + Edge) | GPU | GPU | $0 | $0 (scrapers) | **GPU only** | — |
+| Default, English (Whisper on GPU + Flash-Lite + Edge + Google) | GPU | $1.27 | $0 | $2.20 | **$3.47** + GPU | $0.003 |
+| Default, Indic (Whisper on GPU + Flash-Lite + Sarvam + Google) | GPU | $1.27 | $11.90 | $2.20 | **$15.37** + GPU | $0.015 |
+| All-cloud, cheapest (OpenAI mini STT + Luna + Edge + Brave) | $0.25 | $0.39 | $0 | $0.75 | **$1.39** | $0.001 |
+| All-cloud, Indic quality (Saaras + Flash-Lite + Bulbul + Google) | $0.47 | $1.27 | $11.90 | $2.20 | **$15.84** | $0.016 |
+| Low-latency English (OpenAI mini STT + Haiku + ElevenLabs Flash + Google) | $0.25 | $3.85 | $17.50 | $2.20 | **$23.80** | $0.024 |
+| Fully local (Whisper + Ollama `gemma3:12b` + Edge + scrapers) | GPU | GPU | $0 | $0 | **GPU only** | — |
 
-For scale: 10,000 conversations a month of 10 turns each is 100,000 turns. That costs about $106 on the default English stack or about $1,300 on the default Indic stack, plus the GPU.
+For scale: 10,000 conversations a month of 10 turns each is 100,000 turns. That costs about $350 on the default English stack or about $1,540 on the default Indic stack, plus the GPU, less up to $70 for Google's free searches.
 
 ### Local models on a GPU
 
@@ -317,19 +465,19 @@ Local models (Whisper, Indic-Seamless, Ollama) have no per-token fee; you pay fo
 
 **Estimated cost per 1,000 turns on a GPU you rent by the hour**
 
-Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on an RTX 4090 (≈ 0.6 s on an L4); `gemma3:12b` ≈ 2 s on an RTX 4090 or ≈ 4 s on an L4 (prefill + 80 tokens). Voice traffic is bursty, so the table assumes the GPU is busy **50 %** of the hours you pay for.
+Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on an RTX 4090 (≈ 0.6 s on an L4); `gemma3:12b` ≈ 2.3 s on an RTX 4090 or ≈ 5 s on an L4 (prefill of the ~3,000-token prompt + 100 tokens). Voice traffic is bursty, so the table assumes the GPU is busy **50 %** of the hours you pay for.
 
 | Workload | GPU | Turns / hour at 50 % busy | Per 1,000 turns |
 |---|---|---|---|
 | Whisper STT only | RTX 4090 ($0.44 / h) | ~6,000 | ≈ $0.07 |
 | Whisper STT only | L4 ($0.80 / h) | ~3,000 | ≈ $0.27 |
-| Whisper + `gemma3:12b` | RTX 4090 ($0.44 / h) | ~780 | ≈ $0.56 |
-| Whisper + `gemma3:12b` | L4 ($0.80 / h) | ~390 | ≈ $2.05 |
+| Whisper + `gemma3:12b` | RTX 4090 ($0.44 / h) | ~690 | ≈ $0.64 |
+| Whisper + `gemma3:12b` | L4 ($0.80 / h) | ~320 | ≈ $2.50 |
 | Whisper + `gemma3:12b` | Your own RTX 4090 (electricity only) | — | ≈ $0.04 |
 
 **Rules of thumb**
 
-- A rented GPU is billed whether it is busy or idle. At low traffic, cloud STT + LLM (≈ $0.41–1.03 per 1,000 turns) is cheaper than keeping a GPU running. A $0.44/h RTX 4090 left on 24 × 7 (~$320/month) only pays for itself above roughly **300,000–800,000 turns a month**.
+- A rented GPU is billed whether it is busy or idle. At low traffic, cloud STT + LLM (≈ $0.64–1.74 per 1,000 turns) is cheaper than keeping a GPU running. A $0.44/h RTX 4090 left on 24 × 7 (~$320/month) only pays for itself above roughly **180,000–500,000 turns a month**.
 - Local wins on **privacy** (audio never leaves your machine), **no rate limits** and **predictable latency**. On hardware you already own, the marginal cost is almost only electricity.
 - Local LLMs replace only the cheap part of the bill. TTS is the largest cost, and this project has no local TTS, so Edge (free) is the zero-cost voice.
 
@@ -340,6 +488,17 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 **Voice:** click **Start Listening** and speak. After a pause of `VAD_SILENCE_MS`, the utterance is sent. Talk over the bot to interrupt it.
 
 **Text:** type into the chat box. The reply is streamed and spoken the same way.
+
+**Try it with the sample dealership:**
+
+| Say | What happens |
+|---|---|
+| "What's the price of the Ion?" | Answered from the knowledge base (17.49–21.99 lakh ex-showroom) |
+| "Ridge ki mileage kitni hai?" | Knowledge base, answered in Hindi |
+| "What documents do I need for a test drive?" | Knowledge base (dealership policy) |
+| "Who won the last cricket world cup?" | Not in the knowledge base → "Let me check that for you" → Google |
+| "I want to test drive the Ridge on Saturday at 11 at Baner" | Starts a booking: the agent asks for your name and mobile, reads everything back, books, and a confirmation card appears |
+| "Book a meeting tomorrow at 9 AM" | The agent says slots start at 10 AM and suggests one; if the model tries 9 AM anyway, the server rejects it and returns the nearest free slots |
 
 ### WebSocket protocol (`/ws`)
 
@@ -356,13 +515,14 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 | `status` (`thinking`) | a reply has started |
 | `chunk` | streamed reply text |
 | `audio_chunk` | `{audio: base64, format: "mp3", text}`, played in order |
+| `booking` | `{booking: {booking_id, kind, car_model, showroom, date, weekday, time, customer_name, phone_last4}}` when a booking is confirmed |
 | `done` | `{text, source: "none"|"web"|"kb"}` |
-| `metrics` | `{timings_ms: {stt, retrieval_done, llm_ttft, first_audio, total}}` |
+| `metrics` | `{timings_ms: {stt, filler, retrieval_done, llm_ttft, action_1, first_audio, total}}` (stages that ran) |
 | `error` / `interrupt` | error message / acknowledgement |
 
 ### HTTP endpoints
 
-`GET /health` (engines loaded) · `GET /metrics` (latency percentiles) · `GET /config` (client settings) · `GET /ping`
+`GET /health` (engines loaded) · `GET /metrics` (latency percentiles) · `GET /config` (client settings, business and agent name) · `GET /ping` · `GET /bookings?date=YYYY-MM-DD` (staff only: needs `ADMIN_TOKEN`, returns 404 when unset)
 
 ---
 
@@ -371,14 +531,17 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 ### Where the time goes (one voice turn)
 
 ```
-end of speech ─► VAD_SILENCE_MS ─► STT ─► [retrieval] ─► LLM first token ─► first clause ─► TTS ─► audio
-                   550 ms           GPU:    0 ms for      provider TTFT      ~0.5 s at      provider
-                   (browser)        fast    most turns                       50 tok/s
+end of speech ─► VAD_SILENCE_MS ─► STT ─► [KB → Google] ─► LLM first token ─► first clause ─► TTS ─► audio
+                   550 ms           GPU:    KB < 1 ms;       provider TTFT      ~0.5 s at      provider
+                   (browser)        fast    Google ~1–3 s                       50 tok/s
+                                            (filler spoken at 0.7 s)
 ```
+
+A booking turn adds one more LLM call after the action (one extra time-to-first-token, typically 0.3–0.8 s). The agent says "One moment" before the action, so the customer hears something straight away.
 
 ### What this version optimizes
 
-- **Retrieval off the hot path.** General questions no longer wait on a web search. Only real-time queries (and KB queries, if configured) retrieve. Web engines run concurrently, results are cached, and concurrent identical queries share one fetch.
+- **Retrieval off the hot path.** The local knowledge base answers in under a millisecond. Only questions it can't answer wait for Google, and a spoken filler covers that wait. Small talk, booking details and turns with contact details never wait on retrieval. Results are cached, and concurrent identical queries share one fetch.
 - **Earlier first audio.** The first TTS segment is cut at the first clause boundary after 24 characters (or at a word boundary at 70), instead of at the end of the first sentence or a fixed 90 characters. The emotion-tag prefix the old prompt forced before every answer is gone.
 - **Streaming everywhere.** LLM tokens stream to the client and to TTS. TTS runs concurrently per segment and is delivered in order.
 - **Connection reuse.** One pooled HTTP client (HTTP/2 when available) for Sarvam, ElevenLabs and scraping. SDK clients are singletons. Warmup at startup opens TLS connections and loads model weights. Ollama keeps weights resident (`OLLAMA_KEEP_ALIVE`).
@@ -395,8 +558,9 @@ end of speech ─► VAD_SILENCE_MS ─► STT ─► [retrieval] ─► LLM fir
 | Lowest LLM TTFT | Flash-Lite / Luna / Haiku with minimal thinking (defaults); keep `LLM_MAX_TOKENS` small |
 | Faster end-of-turn | Lower `VAD_SILENCE_MS` (450–500) in quiet environments |
 | Faster first audio | ElevenLabs Flash (English/Hindi/Tamil) or Sarvam (Indic) instead of Edge; lower `TTS_FIRST_CHUNK_MIN_CHARS` |
-| Real-time answers without waiting | `RETRIEVAL_MODE=auto` (default) and `BRAVE_SEARCH_API_KEY` |
-| Never wait on retrieval | `RETRIEVAL_MODE=off` |
+| Shorter waits for Google | Lower `LLM_RETRIEVAL_WAIT` (answers without web data if it expires); keep `RETRIEVAL_FILLER_AFTER` at 0.5–0.8 s |
+| Fewer Google lookups | Add the missing topics to the knowledge base; lower `KB_MIN_COVERAGE` slightly (0.4) |
+| Never wait on retrieval | `RETRIEVAL_MODE=off` (the agent then answers car questions without the catalog, so not recommended) |
 
 ---
 
@@ -455,7 +619,9 @@ These were measured on a CPU-only Windows laptop with no GPU and no LLM API keys
 - **Secrets:** inject API keys as environment variables from your secret store; `.env` is for development.
 - **Health and monitoring:** `/health` returns 503 until all engines are loaded (use it for readiness probes). Scrape `/metrics` for latency SLOs. Logs rotate in `logs/voiceagent.log` (10 MB × 5).
 - **Rate limits:** tune `LLM_MAX_CONCURRENCY` and `TTS_MAX_CONCURRENCY` to your provider tiers. SDK and HTTP retries honor `Retry-After` with short back-off, then fail over.
-- **Web search:** use `BRAVE_SEARCH_API_KEY` in production. HTML scraping is best-effort and subject to the search engines' terms.
+- **Web search:** Google via Gemini grounding (`GEMINI_API_KEY`) is the default; add `BRAVE_SEARCH_API_KEY` as a second engine. HTML scraping is best-effort and subject to the search engines' terms.
+- **Bookings:** SQLite suits a single server. Back up `data/bookings.db`, or send every booking to your CRM with `BOOKING_WEBHOOK_URL`. For several server instances, point `BOOKING_DB_PATH` at shared storage, or replace `booking/service.py` storage with your CRM's API. Set a long random `ADMIN_TOKEN` only if staff need `GET /bookings`.
+- **Knowledge base:** keep `data/knowledge_base/` under version control and review changes like code. It is the source of truth for prices the agent quotes.
 
 ---
 
@@ -473,7 +639,13 @@ These were measured on a CPU-only Windows laptop with no GPU and no LLM API keys
 | Hindi transcribed in Urdu script | Use `large-v3-turbo` (small models confuse the two), set `STT_LANGUAGE=hi`, or use `STT_PROVIDER=sarvam`. The reply is in Hindi either way |
 | Microphone does not work | Allow mic permission; use `http://localhost` or HTTPS |
 | No audio output | Click the page once (browsers need a user gesture before audio plays) |
-| Answers ignore live data | Check the query is real-time (prices, weather, news); raise `LLM_RETRIEVAL_WAIT`; add `BRAVE_SEARCH_API_KEY` |
+| Answers ignore live data | The log line `Retrieval kb+web → none` means both failed; raise `LLM_RETRIEVAL_WAIT`, check `GEMINI_API_KEY` (Google), or add `BRAVE_SEARCH_API_KEY` |
+| Car question answered from Google instead of the catalog | The log shows `KB miss (coverage x/y)`; add that topic to `data/knowledge_base/` or lower `KB_MIN_COVERAGE` |
+| A non-car question gets a car answer | Raise `KB_MIN_COVERAGE` (e.g. 0.6) |
+| `Google search (Gemini grounding) failed` in the log | Check `GEMINI_API_KEY` and `GOOGLE_SEARCH_MODEL`; Brave or the scrapers are used meanwhile |
+| `ZoneInfoNotFoundError: Asia/Kolkata` | `pip install tzdata` (Windows has no system time-zone database) |
+| Booking says the slot is invalid | Slots start every `BOOKING_SLOT_MINUTES` from opening time, at least `BOOKING_MIN_LEAD_MINUTES` ahead; check `BUSINESS_HOURS`, `BUSINESS_DAYS` and `BUSINESS_TIMEZONE` |
+| Test drive refused for a model you sell | Add it to `CAR_MODELS` |
 | Knowledge base errors | `pip install -r requirements-kb.txt`; `gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`; check `GCP_PROJECT_ID` / `GCP_DATA_STORE_ID` |
 | PowerShell won't activate the venv | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 
@@ -485,7 +657,7 @@ Set `LOG_LEVEL=DEBUG` for detailed logs.
 
 ```
 VoiceAgent/
-├── server.py                 FastAPI app: WebSocket pipeline, streaming TTS, /health /metrics /config
+├── server.py                 FastAPI app: WebSocket pipeline, streaming TTS, /health /metrics /config /bookings
 ├── config/
 │   ├── settings.py           All environment configuration (single source of truth)
 │   ├── device.py             CUDA detection + Windows cuBLAS/cuDNN DLL registration
@@ -494,12 +666,22 @@ VoiceAgent/
 │   ├── chunker.py            Streaming text → speakable segments
 │   ├── lang.py               Script-based language ID, speech text cleanup
 │   ├── http.py               Shared async HTTP client + retry/429 handling
-│   └── metrics.py            Per-turn timers and rolling percentiles
+│   ├── metrics.py            Per-turn timers and rolling percentiles
+│   └── privacy.py            Phone/email masking, Indic digit normalisation
 ├── llm/
-│   ├── orchestrator.py       History, retrieval gating, failover, concurrency
+│   ├── orchestrator.py       History, retrieval, filler, booking action loop, failover
+│   ├── prompts.py            CO-STAR system prompt, few-shot examples, calendar, fillers
 │   ├── providers/            gemini.py · openai_llm.py · anthropic_llm.py · ollama_llm.py
-│   ├── retrieval.py          Multilingual routing, KB + web race, cache
-│   └── web_search.py         Brave API · DuckDuckGo + Bing race · gold-rate scraper
+│   ├── knowledge_base.py     Local Markdown KB with BM25 search and coverage check
+│   ├── retrieval.py          KB-first routing → Google fallback, cache
+│   └── web_search.py         Google (Gemini grounding) · Brave API · DuckDuckGo + Bing race
+├── booking/
+│   ├── actions.py            Streaming <action> tag parser (never spoken)
+│   ├── intent.py             Multilingual booking-intent detection
+│   └── service.py            Slots, validation, SQLite storage, CRM webhook
+├── data/
+│   ├── knowledge_base/       cars.md · dealership.md · ownership.md (sample; replace)
+│   └── bookings.db           Created at runtime (git-ignored)
 ├── stt/
 │   ├── faster_whisper_stt.py Local Whisper (CUDA float16 / CPU int8)
 │   ├── cloud_stt.py          Sarvam Saaras · OpenAI transcription
@@ -510,7 +692,7 @@ VoiceAgent/
 │   ├── sarvam.py · cloud_tts.py (OpenAI, ElevenLabs) · edge_tts_engine.py
 ├── static/                   index.html + app.js (browser client)
 ├── scripts/benchmark.py      Component and end-to-end latency benchmarks
-├── tests/                    Offline unit and WebSocket tests (python -m pytest)
+├── tests/                    44 offline tests: pipeline, WebSocket, KB, booking, prompt (python -m pytest)
 ├── requirements*.txt         core · gpu · kb · seamless
 └── .env.example
 ```

@@ -3,8 +3,8 @@ server.py
 VoiceAgent — FastAPI server.
 
 Pipeline per user turn (one WebSocket per browser tab):
-  browser PCM WAV ─► STT ─► language ID ─► [retrieval, only when needed]
-                 ─► LLM stream ─► speech chunker ─► TTS (concurrent, ordered) ─► browser
+  browser PCM WAV ─► STT ─► language ID ─► [knowledge base → Google, when needed]
+                 ─► LLM stream (+ booking actions) ─► speech chunker ─► TTS ─► browser
 
   • Every heavy engine is created and warmed up in parallel at startup.
   • Each turn runs in its own asyncio.Task so barge-in cancels it instantly,
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -24,7 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
+from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
@@ -39,6 +40,7 @@ from core import lang  # noqa: E402
 from core.chunker import SpeechChunker  # noqa: E402
 from core.http import close_http_client  # noqa: E402
 from core.metrics import STATS, TurnTimer  # noqa: E402
+from core.privacy import mask_pii  # noqa: E402
 from llm import AllProvidersFailed, LLMOrchestrator  # noqa: E402
 from stt import STTBase, build_stt_engine  # noqa: E402
 from stt.audio import parse_wav  # noqa: E402
@@ -128,7 +130,21 @@ async def metrics():
 
 @app.get("/config")
 async def client_config():
-    return {"vad_silence_ms": settings.vad_silence_ms}
+    return {"vad_silence_ms": settings.vad_silence_ms,
+            "business_name": settings.business_name,
+            "agent_name": settings.agent_name}
+
+
+@app.get("/bookings", include_in_schema=False)
+async def list_bookings(date: str | None = None, authorization: str = Header(default="")):
+    """Bookings for staff. Disabled unless ADMIN_TOKEN is set; send
+    'Authorization: Bearer <ADMIN_TOKEN>'. Contains customer phone numbers."""
+    token = settings.admin_token
+    if not token or not engines.llm:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {token}".encode()):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await asyncio.to_thread(engines.llm.bookings.list_bookings, date)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -221,7 +237,11 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         source = "none"
         try:
             async for chunk in engines.llm.stream_reply(user_text, session_id, language, timer):
-                source = chunk["source"]
+                if chunk.get("booking"):
+                    await ws.send_json({"type": "booking", "booking": chunk["booking"]})
+                    continue
+                if chunk["provider"] != "filler":
+                    source = chunk["source"]
                 reply.append(chunk["text"])
                 await ws.send_json({"type": "chunk", "text": chunk["text"]})
                 tts.feed(chunk["text"])
@@ -242,7 +262,8 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             return
 
         timer.mark("total")
-        logger.info("BOT [%s] src=%s | %s | %.100s", language, source, timer.summary(), "".join(reply))
+        logger.info("BOT [%s] src=%s | %s | %.100s", language, source, timer.summary(),
+                    mask_pii("".join(reply)))
         await ws.send_json({"type": "done", "text": "".join(reply), "audio": None, "source": source})
         await ws.send_json({"type": "metrics", "timings_ms": timer.summary()})
 
@@ -309,7 +330,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             else:
                 continue
 
-            logger.info("USER [%s|%s]: %.120s", session_id, language, user_text)
+            logger.info("USER [%s|%s]: %.120s", session_id, language, mask_pii(user_text))
             current = asyncio.create_task(respond(user_text, language, timer))
 
     except WebSocketDisconnect:

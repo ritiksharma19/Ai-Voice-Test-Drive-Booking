@@ -1,19 +1,24 @@
 """
 llm/retrieval.py
-Context retrieval with latency-aware, multilingual routing.
+Context retrieval for the dealership agent: knowledge base first, Google second.
 
 Plan per query (RETRIEVAL_MODE=auto, the default):
-  1. Short conversational turns ("hi", "thanks", "ठीक है" …) → no retrieval.
-  2. Real-time / live-data queries in any supported language → web search.
-  3. Everything else → knowledge base (if GCP Discovery Engine is configured,
-     raced against web search), otherwise no retrieval: the LLM answers from
-     its own knowledge immediately instead of waiting on a search it rarely needs.
+  1. Small talk ("hi", "thanks", "ठीक है" …) and turns containing a phone
+     number or email → no retrieval (contact details never leave the server).
+  2. Time-sensitive questions that don't mention the business ("petrol price
+     today", "weather in Pune") → web search only.
+  3. Everything else → knowledge base; if it has no answer → web search.
+     While a booking is being collected, web search is skipped so answers
+     like a name or a date are never sent to a search engine.
 
-RETRIEVAL_MODE=always restores "retrieve for every substantive query";
-RETRIEVAL_MODE=off disables retrieval.
+Knowledge base: the local Markdown catalog in KB_DIR (BM25, < 1 ms) or Google
+Discovery Engine when GCP_PROJECT_ID / GCP_DATA_STORE_ID are set. A slow
+Discovery Engine lookup is hedged by starting the web search after 0.6 s.
+Web search: Google via Gemini grounding, then Brave / scrapers (llm/web_search.py).
 
-The orchestrator waits at most LLM_RETRIEVAL_WAIT seconds; results are cached
-for RETRIEVAL_CACHE_TTL seconds and concurrent identical queries share one fetch.
+RETRIEVAL_MODE=always also tries the web for questions with no KB configured;
+RETRIEVAL_MODE=off disables retrieval. Results are cached for
+RETRIEVAL_CACHE_TTL seconds and concurrent identical queries share one fetch.
 """
 from __future__ import annotations
 
@@ -25,6 +30,8 @@ from collections import OrderedDict
 from config.logging_config import get_logger
 from config.settings import Settings, get_settings
 from core.lang import INDIC_SCRIPT_RE as _INDIC_SCRIPT_RE
+from core.privacy import contains_contact_details
+from llm.knowledge_base import LocalKnowledgeBase, tokenize
 from llm.web_search import WebSearchService
 
 logger = get_logger("llm.retrieval")
@@ -32,6 +39,7 @@ logger = get_logger("llm.retrieval")
 _NONE = {"source": "none", "context": ""}
 _CACHE_MAX = 2000
 _MAX_CONTEXT_CHARS = 3000
+_WEB_HEDGE_S = 0.6       # start web search if a remote KB is still busy after this
 
 # ── Short conversational openers — skip retrieval ─────────────────────────────
 # Note: startswith check + word-count guard in should_retrieve() means that
@@ -198,10 +206,31 @@ def is_realtime(query: str) -> bool:
     return bool(_REALTIME_RE.search(query))
 
 
+# Words that tie a time-sensitive question to the dealership ("current offers on
+# the Ion", "on-road price") so it still goes to the knowledge base first.
+_BUSINESS_TERMS = frozenset(tokenize(
+    "test drive showroom dealer dealership booking offer offers discount emi loan finance "
+    "exchange warranty service servicing variant variants on-road ex-showroom delivery "
+    "insurance accessories waiting period"))
+
+
 class RetrievalService:
     def __init__(self, settings: Settings | None = None) -> None:
         self.s = settings or get_settings()
         self.web = WebSearchService(self.s) if self.s.web_search_enabled else None
+        self.kb_backend = self.s.kb_backend()
+        self.local_kb: LocalKnowledgeBase | None = None
+        if self.kb_backend == "local":
+            self.local_kb = LocalKnowledgeBase(self.s.kb_dir, self.s.kb_min_coverage)
+            if not self.local_kb.available:
+                logger.warning("Local KB is empty (%s) — knowledge base disabled", self.s.kb_dir)
+                self.kb_backend = "off"
+        elif self.kb_backend == "discovery" and not self.s.discovery_configured:
+            logger.warning("KB_PROVIDER=discovery but GCP_PROJECT_ID / GCP_DATA_STORE_ID "
+                           "are not set — knowledge base disabled")
+            self.kb_backend = "off"
+        self._business_terms = _BUSINESS_TERMS | set(tokenize(" ".join(
+            [self.s.business_name, *self.s.car_models, *self.s.showrooms])))
         self._kb_client = None
         self._serving_config = (
             f"projects/{self.s.gcp_project_id}/locations/{self.s.gcp_location}"
@@ -211,15 +240,13 @@ class RetrievalService:
         self._cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
         self._inflight: dict[str, asyncio.Task] = {}
         logger.info("Retrieval | mode=%s kb=%s web=%s wait=%.1fs",
-                    self.s.retrieval_mode,
-                    "on" if self.s.kb_configured else "off",
-                    "on" if self.web else "off",
-                    self.s.retrieval_wait)
+                    self.s.retrieval_mode, self.kb_backend,
+                    self.web.describe() if self.web else "off", self.s.retrieval_wait)
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def warmup(self) -> None:
-        if self.s.kb_configured:
+        if self.kb_backend == "discovery":
             try:
                 await asyncio.to_thread(self._get_kb_client)
             except Exception as exc:
@@ -236,29 +263,36 @@ class RetrievalService:
 
     # ── routing ───────────────────────────────────────────────────────────────
 
-    def plan(self, query: str) -> tuple[str, ...]:
-        """Which sources to query: () | ("web",) | ("kb",) | ("kb", "web")."""
+    def mentions_business(self, query: str) -> bool:
+        return bool(self._business_terms & set(tokenize(query)))
+
+    def plan(self, query: str, booking_active: bool = False) -> tuple[str, ...]:
+        """Sources in the order they are tried: () | ("kb",) | ("web",) | ("kb", "web")."""
         mode = self.s.retrieval_mode
-        if mode == "off" or not query.strip() or is_conversational(query):
+        if (mode == "off" or not query.strip() or is_conversational(query)
+                or contains_contact_details(query)):
             return ()
-        kb_ok = self.s.kb_configured and (self.s.kb_multilingual or not _INDIC_SCRIPT_RE.search(query))
-        if is_realtime(query):
-            return ("web",) if self.web else (("kb",) if kb_ok else ())
-        sources: list[str] = []
+        web_ok = self.web is not None and not booking_active
+        kb_ok = self.kb_backend == "local" or (
+            self.kb_backend == "discovery"
+            and (self.s.kb_multilingual or not _INDIC_SCRIPT_RE.search(query)))
+        if web_ok and is_realtime(query) and not self.mentions_business(query):
+            return ("web",)
         if kb_ok:
-            sources.append("kb")
-        if self.web and (mode == "always" or (kb_ok and mode == "auto")):
-            sources.append("web")
-        return tuple(sources)
+            return ("kb", "web") if web_ok else ("kb",)
+        if web_ok and (is_realtime(query) or mode == "always"):
+            return ("web",)
+        return ()
 
     # ── public ────────────────────────────────────────────────────────────────
 
-    async def get_context(self, query: str, wait: float | None = None) -> dict:
+    async def get_context(self, query: str, wait: float | None = None,
+                          sources: tuple[str, ...] | None = None) -> dict:
         """Best context available within `wait` seconds; never raises."""
-        sources = self.plan(query)
+        sources = self.plan(query) if sources is None else sources
         if not sources:
             return _NONE
-        key = query.strip().lower()
+        key = f"{'+'.join(sources)}|{query.strip().lower()}"
         hit = self._cache.get(key)
         if hit and hit[0] > time.monotonic():
             self._cache.move_to_end(key)
@@ -267,7 +301,7 @@ class RetrievalService:
 
         task = self._inflight.get(key)
         if task is None:
-            task = asyncio.create_task(self._retrieve(query, sources))
+            task = asyncio.create_task(self._retrieve(query, sources, key))
             self._inflight[key] = task
             task.add_done_callback(lambda _t, k=key: self._inflight.pop(k, None))
         try:
@@ -278,28 +312,43 @@ class RetrievalService:
                         wait, "+".join(sources))
             return _NONE
 
-    async def _retrieve(self, query: str, sources: tuple[str, ...]) -> dict:
+    async def _retrieve(self, query: str, sources: tuple[str, ...], key: str) -> dict:
         t0 = time.perf_counter()
-        runners = {"kb": self._kb_search, "web": self._web_search}
-        tasks = {asyncio.create_task(runners[s](query)): s for s in sources}
         result = _NONE
         try:
-            for fut in asyncio.as_completed(tasks, timeout=self.s.retrieval_timeout):
-                try:
-                    source, ctx = await fut
-                except asyncio.TimeoutError:
-                    logger.warning("Retrieval hard timeout (%.1fs)", self.s.retrieval_timeout)
-                    break
-                if ctx and self._is_quality(ctx, query):
-                    result = {"source": source, "context": ctx[:_MAX_CONTEXT_CHARS]}
-                    break
-        finally:
-            for t in tasks:
-                t.cancel()
+            async with asyncio.timeout(self.s.retrieval_timeout):
+                result = await self._kb_then_web(query, sources)
+        except asyncio.TimeoutError:
+            logger.warning("Retrieval hard timeout (%.1fs)", self.s.retrieval_timeout)
         logger.info("Retrieval %s → %s (%d chars, %.0f ms)", "+".join(sources),
                     result["source"], len(result["context"]), (time.perf_counter() - t0) * 1000)
-        self._cache_put(query.strip().lower(), result)
+        self._cache_put(key, result)
         return result
+
+    async def _kb_then_web(self, query: str, sources: tuple[str, ...]) -> dict:
+        kb_task = web_task = None
+        try:
+            if "kb" in sources:
+                kb_task = asyncio.create_task(self._kb_search(query))
+                if "web" in sources and self.kb_backend == "discovery":
+                    done, _ = await asyncio.wait({kb_task}, timeout=_WEB_HEDGE_S)
+                    if not done:
+                        web_task = asyncio.create_task(self._web_search(query))
+                ctx = await kb_task
+                if ctx and self._is_quality(ctx, query):
+                    return {"source": "kb", "context": ctx[:_MAX_CONTEXT_CHARS]}
+                if "web" in sources:
+                    logger.info("KB had no answer — falling back to web search")
+            if "web" in sources:
+                web_task = web_task or asyncio.create_task(self._web_search(query))
+                ctx = await web_task
+                if ctx and self._is_quality(ctx, query):
+                    return {"source": "web", "context": ctx[:_MAX_CONTEXT_CHARS]}
+            return _NONE
+        finally:
+            for task in (kb_task, web_task):
+                if task and not task.done():
+                    task.cancel()
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -308,7 +357,7 @@ class RetrievalService:
         text = ctx.strip()
         if len(text) < 100:
             return False
-        # English-only KB text for an Indic query is accepted only if substantial.
+        # English-only text for an Indic query is accepted only if substantial.
         if _INDIC_SCRIPT_RE.search(query) and not _INDIC_SCRIPT_RE.search(text):
             return len(text) >= 400
         return True
@@ -320,23 +369,25 @@ class RetrievalService:
         while len(self._cache) > _CACHE_MAX:
             self._cache.popitem(last=False)
 
-    async def _web_search(self, query: str) -> tuple[str, str]:
+    async def _web_search(self, query: str) -> str:
         ctx = await self.web.search(query)
         if not ctx and _INDIC_SCRIPT_RE.search(query):
             en_query = _indic_to_english_query(query)
             if en_query:
                 logger.info("Indic web fallback — English keywords: %r", en_query[:60])
                 ctx = await self.web.search(en_query)
-        return "web", ctx
+        return ctx
 
-    async def _kb_search(self, query: str) -> tuple[str, str]:
+    async def _kb_search(self, query: str) -> str:
         try:
-            return "kb", await asyncio.to_thread(self._sync_kb_search, query)
+            if self.kb_backend == "local":
+                return self.local_kb.search(query)
+            return await asyncio.to_thread(self._sync_discovery_search, query)
         except Exception as exc:
             logger.error("KB search error: %s", exc)
-            return "kb", ""
+            return ""
 
-    def _sync_kb_search(self, query: str) -> str:
+    def _sync_discovery_search(self, query: str) -> str:
         from google.cloud import discoveryengine_v1  # type: ignore
         from google.protobuf.json_format import MessageToDict  # type: ignore
 
@@ -354,3 +405,5 @@ class RetrievalService:
                 if content:
                     docs.append(f"Source: {derived.get('title', '')}\n{content}")
         return "\n\n".join(docs)
+
+

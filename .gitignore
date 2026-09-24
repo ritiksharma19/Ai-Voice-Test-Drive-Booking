@@ -22,3 +22,7 @@ models/
 logs/
 *.log
 bench_results/
+
+# Bookings (customer names and phone numbers)
+data/*.db
+data/*.db-journal

@@ -256,6 +256,25 @@
     .thinking-dots span:nth-child(3) { animation-delay: .3s; }
     @keyframes dot { 0%, 80%, 100% { opacity: .3; } 40% { opacity: 1; } }
 
+    .booking-card {
+        border: 1px solid var(--border); border-radius: var(--radius);
+        background: var(--surface); box-shadow: var(--shadow);
+        padding: 14px 16px; animation: msgIn .2s ease;
+    }
+    .booking-head {
+        display: flex; justify-content: space-between; align-items: center; gap: 12px;
+        font-weight: 500; color: var(--listen); margin-bottom: 10px;
+    }
+    .booking-head i { margin-right: 6px; }
+    .booking-id {
+        font-family: 'JetBrains Mono', monospace; font-size: 13px;
+        padding: 2px 8px; border-radius: 999px;
+        color: var(--text); background: var(--surface-2);
+    }
+    .booking-card dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 14px; }
+    .booking-card dt { color: var(--text-dim); }
+    .booking-card dd { overflow-wrap: anywhere; }
+
     .system-msg { text-align: center; }
     .system-bubble {
         display: inline-block; font-size: 13px; padding: 6px 12px; border-radius: var(--radius-sm);
@@ -453,7 +472,7 @@
             <div id="chat-container">
                 <div id="welcome-msg" class="welcome-card">
                     <h3>Hi, I'm VoiceAgent</h3>
-                    <p>Tap the microphone and talk naturally in English or any of nine Indian languages, or type below.</p>
+                    <p>Ask about any of our cars (price, mileage, EV range, features) or book a free test drive or sales meeting. Talk in English or any of nine Indian languages, or type below.</p>
                 </div>
             </div>
 
