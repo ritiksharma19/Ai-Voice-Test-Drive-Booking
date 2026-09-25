@@ -18,6 +18,16 @@ def ascii_digits(text: str) -> str:
     return "".join(str(unicodedata.digit(c)) for c in text if c.isdigit())
 
 
+def indian_mobile(value) -> str:
+    """'+91 98765-43210' / '098765 43210' / '९८७६५४३२१०' → '+919876543210'; '' if invalid."""
+    digits = ascii_digits(str(value))
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return f"+91{digits}" if len(digits) == 10 and digits[0] in "6789" else ""
+
+
 def contains_contact_details(text: str) -> bool:
     return bool(_PHONE_RE.search(text) or _EMAIL_RE.search(text))
 

@@ -26,9 +26,11 @@ class LLMBackend(ABC):
     def stream(self, system: str, messages: list[dict]) -> AsyncIterator[str]:
         """Yield text deltas as soon as the provider produces them."""
 
-    async def warmup(self) -> None:
-        """Open connections / load weights so the first user turn is fast."""
-        async for _ in self.stream("Reply with one word.", [{"role": "user", "content": "Hi"}]):
+    async def warmup(self, system: str = "Reply with one word.") -> None:
+        """Open connections / load weights so the first user turn is fast. Pass the
+        real system prompt to also fill prompt caches (Ollama's KV cache, OpenAI's
+        prefix cache), so the first turn skips re-reading it."""
+        async for _ in self.stream(system, [{"role": "user", "content": "Hi"}]):
             break
 
     async def close(self) -> None:

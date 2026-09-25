@@ -46,8 +46,8 @@ _SORRY = "Sorry, I'm having trouble right now. Please try again in a moment."
 
 
 def authorized(ws: WebSocket, token: str) -> bool:
-    """EXOTEL_WS_TOKEN as `?token=` or as the Basic-auth password
-    (wss://user:<token>@host/telephony/exotel). No token configured = open."""
+    """`token` (EXOTEL_WS_TOKEN, or ACCESS_TOKEN for /ws) as `?token=` or as the
+    Basic-auth password (wss://user:<token>@host/...). No token configured = open."""
     if not token:
         return True
     supplied = ws.query_params.get("token", "")

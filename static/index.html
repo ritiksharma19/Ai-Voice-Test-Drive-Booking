@@ -306,6 +306,91 @@
 
     #mobile-mic-fab { display: none; }
 
+    /* ── Header actions (call back, knowledge base) ─────────── */
+    .chat-header-actions { display: flex; gap: 8px; }
+    .header-btn {
+        display: flex; align-items: center; gap: 7px;
+        height: 34px; padding: 0 12px; border-radius: 999px;
+        border: 1px solid var(--border); background: var(--surface);
+        color: var(--text-sub); font-size: 13px; font-weight: 500; cursor: pointer;
+        transition: color .2s, border-color .2s, background .2s;
+    }
+    .header-btn:hover { color: var(--text); border-color: var(--text-dim); }
+    .header-btn.primary { background: var(--listen-soft); border-color: transparent; color: var(--listen); }
+    .header-btn.primary:hover { border-color: var(--listen); }
+    .header-btn[hidden] { display: none; }
+
+    /* ── Dialogs ────────────────────────────────────────────── */
+    .modal {
+        width: min(440px, calc(100vw - 32px)); max-height: calc(100dvh - 32px);
+        margin: auto; padding: 22px; border-radius: var(--radius);
+        border: 1px solid var(--border); background: var(--surface); color: var(--text);
+        box-shadow: 0 12px 40px rgba(0,0,0,.18);
+    }
+    .modal-wide { width: min(560px, calc(100vw - 32px)); }
+    .modal::backdrop { background: rgba(0,0,0,.35); }
+    .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+    .modal h3 { font-size: 17px; font-weight: 600; }
+    .modal-close {
+        width: 32px; height: 32px; border-radius: 50%; border: none; flex-shrink: 0;
+        background: transparent; color: var(--text-sub); cursor: pointer; font-size: 16px;
+    }
+    .modal-close:hover { background: var(--surface-2); color: var(--text); }
+    .modal-sub { font-size: 14px; line-height: 1.55; color: var(--text-sub); margin-bottom: 16px; }
+    .modal label.field-label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+    .modal input[type=tel] {
+        width: 100%; height: 42px; padding: 0 12px; border-radius: var(--radius-sm);
+        border: 1px solid var(--border); background: var(--bg); color: var(--text);
+        font: inherit; outline: none;
+    }
+    .modal input:focus { border-color: var(--text-dim); }
+    .modal input:disabled { opacity: .5; }
+    .modal-note { font-size: 12px; color: var(--text-dim); margin-top: 8px; line-height: 1.5; }
+    .modal-status { font-size: 13px; min-height: 20px; margin-top: 12px; line-height: 1.5; }
+    .modal-status.ok { color: var(--listen); }
+    .modal-status.err { color: var(--danger); }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .btn-primary, .btn-secondary {
+        height: 40px; padding: 0 16px; border-radius: var(--radius-sm);
+        font-size: 14px; font-weight: 500; cursor: pointer;
+    }
+    .btn-primary { border: none; background: var(--text); color: var(--bg); }
+    .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-secondary { border: 1px solid var(--border); background: var(--surface); color: var(--text-sub); }
+
+    .drop-zone {
+        display: flex; flex-direction: column; align-items: center; gap: 6px;
+        padding: 22px 16px; border-radius: var(--radius);
+        border: 1.5px dashed var(--border); background: var(--bg);
+        color: var(--text-sub); font-size: 14px; text-align: center; cursor: pointer;
+        transition: border-color .2s, background .2s;
+    }
+    .drop-zone i { font-size: 22px; color: var(--accent); }
+    .drop-zone small { font-size: 12px; color: var(--text-dim); }
+    .drop-zone.dragover, .drop-zone:hover { border-color: var(--accent); background: var(--accent-soft); }
+    .drop-zone u { color: var(--accent); }
+    .drop-zone[hidden] { display: none; }
+
+    .kb-list { list-style: none; margin-top: 12px; max-height: 260px; overflow-y: auto; }
+    .kb-list li {
+        display: flex; align-items: center; gap: 10px;
+        padding: 9px 4px; border-bottom: 1px solid var(--border); font-size: 14px;
+    }
+    .kb-list li:last-child { border-bottom: none; }
+    .kb-list .kb-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .kb-list .kb-meta { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+    .kb-tag {
+        font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+        color: var(--text-sub); background: var(--surface-2);
+    }
+    .kb-tag.uploaded { color: var(--accent); background: var(--accent-soft); }
+    .kb-del {
+        width: 30px; height: 30px; border-radius: 50%; border: none; flex-shrink: 0;
+        background: transparent; color: var(--text-dim); cursor: pointer;
+    }
+    .kb-del:hover { color: var(--danger); background: var(--danger-soft); }
+    .kb-empty { font-size: 13px; color: var(--text-dim); padding: 8px 4px; }
+
     /* ── Mobile ─────────────────────────────────────────────── */
     @media (max-width: 767px) {
         header { height: 52px; padding: 0 16px; }
@@ -342,7 +427,9 @@
         #state-prompt { font-size: 13px; }
         .hud-bar, .btn-row { display: none; }
 
-        .chat-header { padding: 12px 16px; }
+        .chat-header { padding: 10px 16px; gap: 8px; }
+        .header-btn { height: 32px; padding: 0 10px; }
+        .header-btn .btn-label-long { display: none; }
         #chat-container { padding: 16px; gap: 16px; }
         .welcome-card { padding: 16px 8px; }
 
@@ -461,6 +548,16 @@
         <section class="chat-panel">
             <div class="chat-header">
                 <span class="chat-header-title">Conversation</span>
+                <div class="chat-header-actions">
+                    <button id="kb-btn" class="header-btn" type="button" hidden
+                            title="Upload knowledge base documents">
+                        <i class="fa-solid fa-book"></i><span>Docs</span>
+                    </button>
+                    <button id="callback-btn" class="header-btn primary" type="button" hidden
+                            title="Our AI assistant calls your phone">
+                        <i class="fa-solid fa-phone"></i><span>Call me<span class="btn-label-long"> back</span></span>
+                    </button>
+                </div>
             </div>
 
             <div id="chat-container">
@@ -487,6 +584,45 @@
 
     </div>
 </div>
+
+<!-- Call me back: the AI agent phones the customer -->
+<dialog id="callback-dialog" class="modal" aria-labelledby="callback-title">
+    <form id="callback-form" novalidate>
+        <div class="modal-head">
+            <h3 id="callback-title">Get a call from our assistant</h3>
+            <button type="button" class="modal-close" data-close aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <p class="modal-sub">Our AI assistant will call you within a minute. Ask about any car or book a test drive, in English or your own language.</p>
+        <label class="field-label" for="callback-phone">Mobile number</label>
+        <input id="callback-phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="98765 43210" maxlength="20">
+        <p class="modal-note">By requesting a call, you agree to be called on this number.</p>
+        <p id="callback-status" class="modal-status" role="status" aria-live="polite"></p>
+        <div class="modal-actions">
+            <button type="button" class="btn-secondary" data-close>Cancel</button>
+            <button type="submit" class="btn-primary" id="callback-submit"><i class="fa-solid fa-phone"></i> Call me</button>
+        </div>
+    </form>
+</dialog>
+
+<!-- Knowledge base documents: upload / delete -->
+<dialog id="kb-dialog" class="modal modal-wide" aria-labelledby="kb-title">
+    <div class="modal-head">
+        <h3 id="kb-title">Knowledge base documents</h3>
+        <button type="button" class="modal-close" data-close aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <p class="modal-sub">Upload .md, .txt or .pdf files with prices, offers or policies. The assistant answers from them right away.</p>
+
+    <div id="kb-manage">
+        <label id="kb-drop" class="drop-zone" for="kb-file">
+            <i class="fa-solid fa-cloud-arrow-up"></i>
+            <span>Drop files here or <u>browse</u></span>
+            <small id="kb-limits">.md, .txt, .pdf</small>
+        </label>
+        <input id="kb-file" type="file" accept=".md,.txt,.pdf" multiple hidden>
+        <ul id="kb-list" class="kb-list"></ul>
+    </div>
+    <p id="kb-status" class="modal-status" role="status" aria-live="polite"></p>
+</dialog>
 
 <script src="/static/app.js"></script>
 </body>

@@ -6,7 +6,9 @@
 let ws;
 const host = window.location.host || "127.0.0.1:8000";
 const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-const socketUrl = `${protocol}//${host}/ws`;
+// ACCESS_TOKEN on the server → open the page as /?token=<ACCESS_TOKEN>
+const accessToken = new URLSearchParams(window.location.search).get("token");
+const socketUrl = `${protocol}//${host}/ws` + (accessToken ? `?token=${encodeURIComponent(accessToken)}` : "");
 
 // Exponential backoff reconnect state
 let _wsReconnectDelay = 1000;
@@ -81,6 +83,8 @@ function init() {
     setupWebSocket();
     setupSpeechRecognition();
     setupEventListeners();
+    setupCallback();
+    setupKnowledgeBase();
     fetchSystemInfo();
     fetchClientConfig();
 
@@ -103,7 +107,11 @@ async function fetchClientConfig() {
             businessLabel = `${cfg.agent_name} · ${cfg.business_name}`;
             const h = document.querySelector("#welcome-msg h3");
             if (h) h.textContent = `Hi, I'm ${cfg.agent_name} from ${cfg.business_name}`;
+            document.getElementById("callback-title").textContent = `Get a call from ${cfg.agent_name}`;
         }
+        document.getElementById("callback-btn").hidden = !cfg.callback_enabled;
+        callbackReady = Boolean(cfg.callback_ready);
+        document.getElementById("kb-btn").hidden = !cfg.kb_uploads;
     } catch (_) { /* keep default */ }
 }
 
@@ -220,6 +228,14 @@ function setupWebSocket() {
         setUIState("idle");
         stopMediaRecorderAndContext();
         stopWaveform();
+
+        if (event.code === 1008) {   // bad or missing ACCESS_TOKEN: retrying won't help
+            appendSystemMessage("Access denied. Open this page with the link that includes ?token=…");
+            return;
+        }
+        if (event.code === 1013 && _wsReconnectDelay === 1000) {
+            appendSystemMessage("The assistant is busy with other customers. Reconnecting…");
+        }
 
         setTimeout(() => {
             if (!ws || ws.readyState === WebSocket.CLOSED) setupWebSocket();
@@ -805,6 +821,191 @@ function appendSystemMessage(text) {
     el.innerHTML = `<div class="system-bubble"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHTML(text)}</div>`;
     chatContainer.appendChild(el);
     scrollToBottom();
+}
+
+// ==========================================================================
+// DIALOGS — call me back, knowledge base documents
+// ==========================================================================
+
+function setupDialogClose(dialog) {
+    dialog.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => dialog.close()));
+    dialog.addEventListener("click", (e) => { if (e.target === dialog) dialog.close(); });   // backdrop
+}
+
+function setStatus(el, text, kind = "") {
+    el.textContent = text;
+    el.className = `modal-status ${kind}`;
+}
+
+async function readError(res) {
+    try { return (await res.json()).detail || `Error ${res.status}`; }
+    catch (_) { return `Error ${res.status}`; }
+}
+
+function formatSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1048576) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+// ── Call me back: the AI agent phones the customer ─────────────────────────
+
+let callbackReady = false;   // /config: Exotel outbound calling is configured
+
+function setupCallback() {
+    const dialog = document.getElementById("callback-dialog");
+    const form = document.getElementById("callback-form");
+    const phone = document.getElementById("callback-phone");
+    const status = document.getElementById("callback-status");
+    const submit = document.getElementById("callback-submit");
+    setupDialogClose(dialog);
+
+    document.getElementById("callback-btn").addEventListener("click", () => {
+        setStatus(status, "");
+        submit.disabled = false;
+        dialog.showModal();
+        phone.focus();
+    });
+
+    form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        if (!phone.value.trim()) {
+            setStatus(status, "Please enter your mobile number.", "err");
+            return;
+        }
+        if (!callbackReady) {
+            setStatus(status, "Phone call-backs aren't set up on this server yet. " +
+                              "Please talk or type here instead.", "err");
+            return;
+        }
+        submit.disabled = true;
+        setStatus(status, "Requesting your call…");
+        try {
+            const res = await fetch(withPageToken("/callback"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ phone: phone.value }),
+            });
+            if (!res.ok) {
+                setStatus(status, await readError(res), "err");
+                submit.disabled = false;
+                return;
+            }
+            const last4 = phone.value.replace(/\D/g, "").slice(-4);
+            setStatus(status, `Calling ••••••${last4} now. Please keep your phone nearby.`, "ok");
+        } catch (_) {
+            setStatus(status, "Network error. Please try again.", "err");
+            submit.disabled = false;
+        }
+    });
+}
+
+// ── Knowledge base documents (upload / delete) ─────────────────────────────
+
+// Adds the page's ACCESS_TOKEN (if any) to an API path.
+function withPageToken(path) {
+    return accessToken ? `${path}?token=${encodeURIComponent(accessToken)}` : path;
+}
+
+function setupKnowledgeBase() {
+    const dialog = document.getElementById("kb-dialog");
+    const drop = document.getElementById("kb-drop");
+    const fileInput = document.getElementById("kb-file");
+    const list = document.getElementById("kb-list");
+    const status = document.getElementById("kb-status");
+    const limits = document.getElementById("kb-limits");
+    setupDialogClose(dialog);
+
+    async function loadDocs() {
+        let res;
+        try { res = await fetch(withPageToken("/kb/documents")); }
+        catch (_) { setStatus(status, "Network error.", "err"); return false; }
+        if (!res.ok) { setStatus(status, await readError(res), "err"); return false; }
+        const data = await res.json();
+        drop.hidden = !data.uploads_enabled;
+        limits.textContent = `.md, .txt, .pdf · up to ${data.max_mb} MB each`;
+        if (!data.uploads_enabled) {
+            setStatus(status, "This server uses Google Discovery Engine, so uploads are turned off here.", "err");
+        }
+        renderDocs(data.documents);
+        return true;
+    }
+
+    function renderDocs(docs) {
+        list.innerHTML = "";
+        if (!docs.length) {
+            list.innerHTML = `<li class="kb-empty">No documents yet.</li>`;
+            return;
+        }
+        for (const d of docs) {
+            const li = document.createElement("li");
+            li.innerHTML = `<i class="fa-regular fa-file-lines"></i>
+                <span class="kb-name">${escapeHTML(d.name)}</span>
+                <span class="kb-meta">${formatSize(d.size)}</span>
+                <span class="kb-tag ${d.uploaded ? "uploaded" : ""}">${d.uploaded ? "Uploaded" : "Built-in"}</span>`;
+            if (d.uploaded) {
+                const del = document.createElement("button");
+                del.type = "button";
+                del.className = "kb-del";
+                del.title = `Delete ${d.name}`;
+                del.setAttribute("aria-label", del.title);
+                del.innerHTML = `<i class="fa-regular fa-trash-can"></i>`;
+                del.addEventListener("click", () => deleteDoc(d.name));
+                li.appendChild(del);
+            }
+            list.appendChild(li);
+        }
+    }
+
+    async function uploadFiles(files) {
+        files = [...files];
+        if (!files.length) return;
+        const errors = [];
+        let added = 0, chunks = 0;
+        for (const [i, file] of files.entries()) {
+            setStatus(status, `Uploading ${file.name} (${i + 1} of ${files.length})…`);
+            try {
+                const res = await fetch(withPageToken(`/kb/documents/${encodeURIComponent(file.name)}`),
+                                        { method: "PUT", body: file });
+                if (!res.ok) { errors.push(`${file.name}: ${await readError(res)}`); continue; }
+                chunks = (await res.json()).chunks;
+                added++;
+            } catch (_) {
+                errors.push(`${file.name}: network error`);
+            }
+        }
+        fileInput.value = "";
+        if (!(await loadDocs())) return;
+        if (errors.length) setStatus(status, errors.join(" · "), "err");
+        else setStatus(status, `Added ${added} document${added === 1 ? "" : "s"}. ` +
+                               `The assistant uses them now (${chunks} sections indexed).`, "ok");
+    }
+
+    async function deleteDoc(name) {
+        if (!window.confirm(`Delete ${name} from the knowledge base?`)) return;
+        try {
+            const res = await fetch(withPageToken(`/kb/documents/${encodeURIComponent(name)}`),
+                                    { method: "DELETE" });
+            if (!res.ok) { setStatus(status, await readError(res), "err"); return; }
+            if (await loadDocs()) setStatus(status, `Deleted ${name}.`, "ok");
+        } catch (_) {
+            setStatus(status, "Network error.", "err");
+        }
+    }
+
+    document.getElementById("kb-btn").addEventListener("click", () => {
+        setStatus(status, "");
+        dialog.showModal();
+        loadDocs();
+    });
+    fileInput.addEventListener("change", () => uploadFiles(fileInput.files));
+    drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("dragover"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
+    drop.addEventListener("drop", (e) => {
+        e.preventDefault();
+        drop.classList.remove("dragover");
+        uploadFiles(e.dataTransfer.files);
+    });
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

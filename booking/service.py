@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 
 from config.logging_config import get_logger
 from config.settings import Settings
-from core.privacy import ascii_digits
+from core.privacy import indian_mobile
 
 logger = get_logger("booking")
 
@@ -221,12 +221,7 @@ class BookingService:
 
     @staticmethod
     def _phone(value) -> str:
-        digits = ascii_digits(str(value))
-        if len(digits) == 12 and digits.startswith("91"):
-            digits = digits[2:]
-        elif len(digits) == 11 and digits.startswith("0"):
-            digits = digits[1:]
-        return f"+91{digits}" if len(digits) == 10 and digits[0] in "6789" else ""
+        return indian_mobile(value)
 
     def _car_model(self, value, required: bool, fields: dict) -> str:
         text = str(value or "").strip()

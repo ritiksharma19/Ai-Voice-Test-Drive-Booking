@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from dataclasses import replace
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import server
 from stt.audio import encode_wav
@@ -96,3 +100,75 @@ def test_text_turn_and_health():
     assert health["status"] == "ok" and health["engines"]["stt"] == "fake-stt"
     assert "llm_ttft" in client.get("/metrics").json()
     assert client.get("/config").json()["vad_silence_ms"] > 0
+
+
+def _with_settings(monkeypatch, **overrides):
+    monkeypatch.setattr(server, "settings", replace(server.settings, **overrides))
+
+
+def _close_code(ws) -> int:
+    with pytest.raises(WebSocketDisconnect) as exc:
+        ws.receive_json()
+    return exc.value.code
+
+
+def test_access_token_required(monkeypatch):
+    _with_settings(monkeypatch, access_token="s3cret")
+    _install_fakes(("Hi.",))
+    client = TestClient(server.app)
+    with client.websocket_connect("/ws") as ws:
+        assert _close_code(ws) == 1008
+    with client.websocket_connect("/ws?token=wrong") as ws:
+        assert _close_code(ws) == 1008
+    with client.websocket_connect("/ws?token=s3cret") as ws:
+        ws.send_json({"type": "text", "text": "hello"})
+        assert _drain(ws)[-1]["type"] == "metrics"
+
+
+def test_session_cap(monkeypatch):
+    _with_settings(monkeypatch, max_sessions=1)
+    _install_fakes(("Hi.",))
+    client = TestClient(server.app)
+    with client.websocket_connect("/ws") as first:
+        with client.websocket_connect("/ws") as second:
+            assert _close_code(second) == 1013
+        first.send_json({"type": "text", "text": "hello"})
+        assert _drain(first)[-1]["type"] == "metrics"
+    with client.websocket_connect("/ws") as again:     # slot released on disconnect
+        again.send_json({"type": "text", "text": "hello"})
+        assert _drain(again)[-1]["type"] == "metrics"
+
+
+def test_turn_rate_limit(monkeypatch):
+    _with_settings(monkeypatch, max_turns_per_minute=1)
+    _install_fakes(("Hi.",))
+    client = TestClient(server.app)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "text", "text": "hello"})
+        assert _drain(ws)[-1]["type"] == "metrics"
+        ws.send_json({"type": "text", "text": "hello again"})
+        error = _drain(ws)[-1]
+        assert error["type"] == "error" and "too quickly" in error["text"]
+
+
+class SlowSTT(FakeSTT):
+    async def transcribe(self, samples, sample_rate=16000, language=None):
+        await asyncio.sleep(5)
+        return await super().transcribe(samples, sample_rate, language)
+
+
+def test_barge_in_during_stt():
+    """Interrupts are handled while Whisper is still busy, and the cancelled
+    utterance never produces a transcription or reply."""
+    _install_fakes(("Hello there.",))
+    server.engines.stt = SlowSTT()
+    client = TestClient(server.app)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_bytes(encode_wav(np.zeros(16_000, np.float32)))
+        t0 = time.monotonic()
+        ws.send_json({"type": "interrupt"})
+        assert ws.receive_json()["type"] == "interrupt"
+        assert time.monotonic() - t0 < 2
+        ws.send_json({"type": "text", "text": "hello"})
+        msgs = _drain(ws)
+    assert "transcription" not in [m["type"] for m in msgs]

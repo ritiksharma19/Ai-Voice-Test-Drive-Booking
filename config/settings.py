@@ -113,6 +113,7 @@ class Settings:
     kb_provider: str = field(default_factory=lambda: _str("KB_PROVIDER", "auto").lower())
     kb_dir: str = field(default_factory=lambda: _str("KB_DIR", "data/knowledge_base"))
     kb_min_coverage: float = field(default_factory=lambda: _float("KB_MIN_COVERAGE", 0.5))
+    kb_upload_max_mb: int = field(default_factory=lambda: _int("KB_UPLOAD_MAX_MB", 10))
     web_search_enabled: bool = field(default_factory=lambda: _bool("WEB_SEARCH_ENABLED", True))
     # auto = google (Gemini grounding) if GEMINI_API_KEY, then brave, then scrapers | google | brave | scrape
     web_search_provider: str = field(default_factory=lambda: _str("WEB_SEARCH_PROVIDER", "auto").lower())
@@ -133,6 +134,7 @@ class Settings:
     whisper_device: str = field(default_factory=lambda: _str("WHISPER_DEVICE", "auto").lower())
     whisper_compute_type: str = field(default_factory=lambda: _str("WHISPER_COMPUTE_TYPE", "auto").lower())
     whisper_beam_size: int = field(default_factory=lambda: _int("WHISPER_BEAM_SIZE", 1))
+    whisper_workers: int = field(default_factory=lambda: max(1, _int("WHISPER_WORKERS", 1)))
     seamless_model: str = field(default_factory=lambda: _str("SEAMLESS_MODEL", "ai4bharat/indic-seamless"))
     sarvam_stt_model: str = field(default_factory=lambda: _str("SARVAM_STT_MODEL", "saaras:v3"))
     openai_stt_model: str = field(default_factory=lambda: _str("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe"))
@@ -170,11 +172,24 @@ class Settings:
     # "" = "Hello! This is <AGENT_NAME> from <BUSINESS_NAME>…" | "off" = no greeting
     telephony_greeting: str = field(default_factory=lambda: _str("TELEPHONY_GREETING"))
     telephony_language: str = field(default_factory=lambda: _str("TELEPHONY_LANGUAGE", "en").lower())
+    # "Call me back" button: the AI agent phones the customer (needs the outbound EXOTEL_* settings)
+    callback_enabled: bool = field(default_factory=lambda: _bool("CALLBACK_ENABLED", True))
+    callback_per_hour: int = field(default_factory=lambda: _int("CALLBACK_PER_HOUR", 20))
+    callback_number_cooldown_min: int = field(default_factory=lambda: _int("CALLBACK_NUMBER_COOLDOWN_MIN", 10))
+    callback_per_client_per_hour: int = field(default_factory=lambda: _int("CALLBACK_PER_CLIENT_PER_HOUR", 3))
 
     # ── Server ───────────────────────────────────────────────────────────────
     cors_origins: list[str] = field(default_factory=lambda: [
         o.strip() for o in _str("CORS_ORIGINS", "*").split(",") if o.strip()])
     max_audio_seconds: int = field(default_factory=lambda: _int("MAX_AUDIO_SECONDS", 30))
+    access_token: str = field(default_factory=lambda: _str("ACCESS_TOKEN"))   # "" = open
+    max_sessions: int = field(default_factory=lambda: _int("MAX_SESSIONS", 50))   # 0 = unlimited
+    max_turns_per_minute: int = field(default_factory=lambda: _int("MAX_TURNS_PER_MINUTE", 20))
+
+    @property
+    def outbound_calls_configured(self) -> bool:
+        return all((self.exotel_account_sid, self.exotel_api_key, self.exotel_api_token,
+                    self.exotel_caller_id, self.exotel_app_id))
 
     @property
     def discovery_configured(self) -> bool:

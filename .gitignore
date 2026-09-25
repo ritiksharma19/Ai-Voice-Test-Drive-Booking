@@ -26,3 +26,6 @@ bench_results/
 # Bookings (customer names and phone numbers)
 data/*.db
 data/*.db-journal
+
+# Knowledge base documents uploaded from the browser (may be confidential)
+data/knowledge_base/uploads/

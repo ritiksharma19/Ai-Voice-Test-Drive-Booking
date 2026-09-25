@@ -2,6 +2,8 @@
 
 **VoiceAgent is a real-time, multilingual voice agent for car dealerships. Customers ask about cars and book test drives or sales meetings by talking, in English or any of nine Indian languages.** It runs on closed models (Gemini, GPT, Claude, Sarvam, ElevenLabs) and open models (Whisper, Gemma via Ollama, AI4Bharat Indic-Seamless), in any mix, and switches automatically when a provider fails.
 
+![VoiceAgent in the browser: voice panel with the active LLM, STT and TTS models, and a live conversation with Priya from Aurora Motors](docs/app-screenshot.png)
+
 A customer opens the dealership's website and talks. VoiceAgent answers questions about the cars (price, variants, mileage, EV range, features, finance, warranty) from the dealership's own **knowledge base**. If the knowledge base has no answer, it searches **Google**. When the customer is ready, it books a **test drive** or a **sales meeting**: it collects the details, checks the slot, saves the booking and reads back a booking ID.
 
 - **Knowledge base first, Google second:** answers come from the dealership's verified data; only questions it can't answer go to Google Search
@@ -195,7 +197,7 @@ chmod +x cloudflared
 
 - **Phone calls (Exotel):** use `wss://random-words.trycloudflare.com/telephony/exotel` as the stream URL, and set `EXOTEL_WS_TOKEN` (see [Phone calls](#phone-calls-exotel)).
 - **The URL changes** every time `cloudflared` restarts. For a fixed domain, create a named tunnel in your Cloudflare account (`cloudflared tunnel login`, then `cloudflared tunnel create voiceagent`).
-- **Share with care:** anyone with the URL can use your LLM and TTS credits. Stop the tunnel with **Ctrl+C** when you're done.
+- **Protect it:** anyone with the URL can use your LLM and TTS credits. Before starting the tunnel, set `ACCESS_TOKEN="some-long-random-string"` in `.env` and restart the server. Then share `https://random-words.trycloudflare.com/?token=some-long-random-string`; visitors without the token are refused. Stop the tunnel with **Ctrl+C** when you're done.
 
 ### 5. Restarting after the Studio sleeps
 
@@ -580,13 +582,14 @@ Providers without a key are skipped with a warning. Edge TTS needs no key and is
 | `BOOKING_MIN_LEAD_MINUTES` / `BOOKING_MAX_DAYS_AHEAD` | `60` / `30` | Booking window |
 | `BOOKING_DB_PATH` | `data/bookings.db` | SQLite file (git-ignored) |
 | `BOOKING_WEBHOOK_URL` | — | Receives every new booking as JSON (`event: booking.created`) |
-| `ADMIN_TOKEN` | — | Enables `GET /bookings` for staff |
+| `ADMIN_TOKEN` | — | Staff token: enables `GET /bookings` and staff-placed outbound calls |
 
 ### Knowledge base and web search
 
 | Variable | Default | Notes |
 |---|---|---|
-| `KB_DIR` | `data/knowledge_base` | Markdown / text files, indexed at startup |
+| `KB_DIR` | `data/knowledge_base` | Markdown / text files, indexed at startup and again after every upload |
+| `KB_UPLOAD_MAX_MB` | `10` | Largest file staff can upload from the **Docs** button (.md, .txt, .pdf) |
 | `KB_MIN_COVERAGE` | `0.5` | Share of the question's words the KB must match to count as an answer; raise it to send more questions to Google |
 | `GOOGLE_SEARCH_MODEL` / `SEARCH_REGION` | `gemini-3.5-flash-lite` / `India` | Model used for Google grounding, and the market it focuses on |
 | `LLM_RETRIEVAL_WAIT` | `3` s | Longest the answer waits for KB + Google (the KB alone takes < 1 ms) |
@@ -604,6 +607,7 @@ Providers without a key are skipped with a warning. Edge TTS needs no key and is
 | `OLLAMA_MODEL` / `OLLAMA_KEEP_ALIVE` | `gemma3:12b` / `30m` | keep-alive keeps weights resident in VRAM |
 | `WHISPER_MODEL` | *(auto)* | `large-v3-turbo` on GPU, `small` on CPU; also `medium`, `large-v3`, `distil-large-v3` (English) |
 | `WHISPER_COMPUTE_TYPE` | `auto` | `float16` on GPU, `int8` on CPU; `int8_float16` saves VRAM |
+| `WHISPER_WORKERS` | `1` | Utterances transcribed in parallel. Use 2–4 on a GPU when several people talk at once; keep `1` on CPU |
 | `STT_LANGUAGE` | *(empty)* | Force one language (e.g. `hi`) to skip language detection |
 | `STT_LANGUAGES` | all 10 | Whisper's language ID is restricted to these (Urdu → Hindi, etc.) |
 | `LLM_MAX_TOKENS` | `400` | Spoken replies are short; caps cost and runaway answers |
@@ -629,6 +633,17 @@ Providers without a key are skipped with a warning. Edge TTS needs no key and is
 | `EXOTEL_ACCOUNT_SID` / `EXOTEL_API_KEY` / `EXOTEL_API_TOKEN` | — | Outbound calls only (Exotel dashboard → Settings → API) |
 | `EXOTEL_SUBDOMAIN` | `api.exotel.com` | `api.in.exotel.com` for accounts on the Mumbai cluster |
 | `EXOTEL_CALLER_ID` / `EXOTEL_APP_ID` | — | Outbound calls: your ExoPhone, and the call flow that contains the Voicebot applet |
+| `CALLBACK_ENABLED` | `true` | Shows the **Call me back** button. It places calls once all the outbound settings above are set |
+| `CALLBACK_PER_HOUR` / `CALLBACK_PER_CLIENT_PER_HOUR` | `20` / `3` | Call-backs in total, and per visitor IP, per hour |
+| `CALLBACK_NUMBER_COOLDOWN_MIN` | `10` | One call per phone number in this window |
+
+### Access and limits (browser)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ACCESS_TOKEN` | — | Required for the chat (`/ws`), **Docs** uploads and **Call me back** when set. Share the page as `https://your.host/?token=<ACCESS_TOKEN>`; the page passes it on. **Set it before sharing a public URL** |
+| `MAX_SESSIONS` | `50` | Concurrent browser sessions; extra visitors see "busy" and retry automatically. `0` = unlimited |
+| `MAX_TURNS_PER_MINUTE` | `20` | Per browser session; protects your LLM and TTS credits from scripted abuse. `0` = off |
 
 ---
 
@@ -827,6 +842,10 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 
 **Text:** type into the chat box. The reply is streamed and spoken the same way.
 
+**Call me back:** the customer clicks **Call me back** and enters a mobile number, and the AI agent phones them through Exotel. The call is the same agent as in the browser: it can answer questions and book test drives. The button is always shown (set `CALLBACK_ENABLED=false` to hide it). Calls go out only once the outbound `EXOTEL_*` settings are complete (see [Outbound calls](#outbound-calls-the-agent-calls-the-customer)); until then the dialog tells the customer that call-backs aren't available. Because anyone on the page can use it, requests are limited per number (`CALLBACK_NUMBER_COOLDOWN_MIN`), per visitor (`CALLBACK_PER_CLIENT_PER_HOUR`) and in total (`CALLBACK_PER_HOUR`). The page also needs `ACCESS_TOKEN` when one is set.
+
+**Upload knowledge base documents:** click **Docs** and drop in `.md`, `.txt` or `.pdf` files with price lists, offers or policies. They are saved as text in `data/knowledge_base/uploads/`, and the index is rebuilt at once, so the next question can use them. Long documents are split into sections of about 1,200 characters. Uploaded files can be deleted from the same dialog; the built-in files are edited in the repository. Markdown with `#` headings gives the best answers, because each heading becomes a searchable section. Scanned PDFs have no text layer and must be run through OCR first. Uploads apply to the local knowledge base only, not to Discovery Engine, and the `uploads/` folder is git-ignored because it may hold confidential documents. **Anyone who can open the page can upload and delete documents**, and so change what the agent tells customers (prices, offers). Before sharing a public URL, set `ACCESS_TOKEN`; uploads then need the same `?token=` link as the chat.
+
 **Try it with the sample dealership:**
 
 | Say | What happens |
@@ -861,7 +880,7 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 
 ### HTTP endpoints
 
-`GET /health` (engines loaded) · `GET /metrics` (latency percentiles) · `GET /config` (client settings, business and agent name) · `GET /ping` · `GET /bookings?date=YYYY-MM-DD` (staff only: needs `ADMIN_TOKEN`, returns 404 when unset) · `POST /telephony/exotel/call` (staff only: place an outbound call, see [Phone calls](#phone-calls-exotel)) · `WS /telephony/exotel` (Exotel audio stream)
+`GET /health` (engines loaded) · `GET /metrics` (latency percentiles) · `GET /config` (client settings, business and agent name) · `GET /ping` · `GET /bookings?date=YYYY-MM-DD` (staff only: needs `ADMIN_TOKEN`, returns 404 when unset) · `POST /telephony/exotel/call` (staff only: place an outbound call, see [Phone calls](#phone-calls-exotel)) · `WS /telephony/exotel` (Exotel audio stream) · `POST /callback` (customer: `{"phone": "..."}`, rate-limited) · `GET /kb/documents`, `PUT /kb/documents/{filename}` (raw file as the body), `DELETE /kb/documents/{name}` (knowledge base documents; need `?token=` when `ACCESS_TOKEN` is set)
 
 ---
 
@@ -947,6 +966,36 @@ curl -X POST http://localhost:8000/telephony/exotel/call `
 ```
 
 Exotel rings the customer. When they answer, Exotel connects them to the call flow `EXOTEL_APP_ID`, whose Voicebot applet streams to `/telephony/exotel`. The request is deliberately not retried, so a timeout can never ring the customer twice. Follow Exotel's and TRAI's rules for outbound and promotional calls (DND, calling hours, consent).
+
+### Set up the "Call me back" button (step by step)
+
+The button on the web page asks for the customer's mobile number, and the agent calls them. It uses the outbound call above, so it needs an Exotel account and a public URL.
+
+1. **Exotel account:** sign up at [exotel.com](https://exotel.com) and get an **ExoPhone** (the number customers see).
+2. **API credentials:** in the Exotel dashboard go to **Settings → API**, and copy the Account SID, API key and API token into `.env`:
+   ```ini
+   EXOTEL_ACCOUNT_SID="..."
+   EXOTEL_API_KEY="..."
+   EXOTEL_API_TOKEN="..."
+   EXOTEL_CALLER_ID="..."      # your ExoPhone
+   EXOTEL_SUBDOMAIN="api.exotel.com"   # api.in.exotel.com for the Mumbai cluster
+   EXOTEL_WS_TOKEN="a-long-random-string"
+   ```
+3. **Public URL:** Exotel must reach your server over `wss://`. For testing, use a Cloudflare quick tunnel:
+   ```powershell
+   winget install --id Cloudflare.cloudflared -e     # Windows; Linux: see the Lightning AI section
+   cloudflared tunnel --url http://localhost:8000
+   ```
+   It prints an address such as `https://random-words.trycloudflare.com`. The address changes every time the tunnel restarts, so update the call flow (next step) when it does.
+4. **Call flow:** in **App Bazaar**, create a call flow with a **Voicebot** applet whose URL is
+   ```
+   wss://random-words.trycloudflare.com/telephony/exotel?sample-rate=8000&token=<EXOTEL_WS_TOKEN>
+   ```
+   Save it and copy the flow's app ID into `.env` as `EXOTEL_APP_ID`.
+5. **Protect the public page:** set `ACCESS_TOKEN` in `.env` and share the page as `https://random-words.trycloudflare.com/?token=<ACCESS_TOKEN>`. Without it, anyone with the address can use the chat, upload documents and request calls. Exotel's connection uses `EXOTEL_WS_TOKEN`, so it is not affected.
+6. **Restart** the server. `GET /config` now shows `"callback_ready": true`, and **Call me back** rings the number that is entered. Until all five outbound values are set, the dialog says call-backs aren't set up yet.
+
+Limits against abuse: one call per number every `CALLBACK_NUMBER_COOLDOWN_MIN` (10) minutes, `CALLBACK_PER_CLIENT_PER_HOUR` (3) per visitor, and `CALLBACK_PER_HOUR` (20) in total. Follow TRAI's rules for calling hours and consent.
 
 ### How audio is handled
 
@@ -1050,6 +1099,7 @@ These were measured on a CPU-only Windows laptop with no GPU and no LLM API keys
   ```
 - **HTTPS is required** for microphone access anywhere except `localhost`. Put a reverse proxy in front (Caddy, Nginx, IIS with the WebSocket module) or use `cloudflared tunnel --url http://localhost:8000` for quick sharing.
 - **Lock down CORS:** `CORS_ORIGINS=https://your.domain`.
+- **Limit access:** set `ACCESS_TOKEN` for private demos, and size `MAX_SESSIONS` and `MAX_TURNS_PER_MINUTE` for your traffic (see [Access and limits](#access-and-limits-browser)). With several users on one GPU, raise `WHISPER_WORKERS` to 2–4 so transcriptions don't queue.
 - **Telephony:** Exotel needs a public `wss://` URL with a valid TLS certificate, and the proxy must pass WebSocket upgrades on `/telephony/exotel`. Always set `EXOTEL_WS_TOKEN`, because an open stream endpoint lets anyone spend your LLM and TTS credits. Each call holds one WebSocket and one turn at a time, so size `LLM_MAX_CONCURRENCY` and `TTS_MAX_CONCURRENCY` for your peak concurrent calls.
 - **Windows service:** run under [NSSM](https://nssm.cc) or Task Scheduler with the venv's `python.exe -m uvicorn ...` and the project folder as working directory.
 - **Secrets:** inject API keys as environment variables from your secret store; `.env` is for development.
@@ -1116,7 +1166,7 @@ VoiceAgent/
 │   ├── orchestrator.py       History, retrieval, filler, booking action loop, failover
 │   ├── prompts.py            CO-STAR system prompt, few-shot examples, calendar, fillers
 │   ├── providers/            gemini.py · openai_llm.py · anthropic_llm.py · ollama_llm.py
-│   ├── knowledge_base.py     Local Markdown KB with BM25 search and coverage check
+│   ├── knowledge_base.py     Local Markdown KB (BM25, coverage check) + staff document uploads
 │   ├── topic_guard.py        Multilingual on-topic check (cars / dealership only)
 │   ├── retrieval.py          KB-first routing → Google fallback, cache
 │   └── web_search.py         Google (Gemini grounding) · Brave API · DuckDuckGo + Bing race
@@ -1137,10 +1187,11 @@ VoiceAgent/
 │   ├── sarvam.py · cloud_tts.py (OpenAI, ElevenLabs) · edge_tts_engine.py
 ├── telephony/
 │   ├── exotel.py             Exotel Voicebot stream: call session, barge-in, outbound calls
+│   ├── callback.py           Abuse limits for the public "Call me back" button
 │   └── audio.py              MP3 → phone PCM (PyAV), Exotel-sized chunks
 ├── static/                   index.html + app.js (browser client)
 ├── scripts/benchmark.py      Component and end-to-end latency benchmarks
-├── tests/                    69 offline tests: pipeline, WebSocket, telephony + VAD, KB, guardrail, booking, prompt (python -m pytest)
+├── tests/                    86 offline tests: pipeline, WebSocket + access limits, telephony + VAD, KB + uploads, call-backs, guardrail, booking, prompt (python -m pytest)
 ├── requirements*.txt         core · gpu · kb · seamless
 └── .env.example
 ```

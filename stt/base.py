@@ -4,8 +4,8 @@ Interface for speech-to-text backends.
 
 `transcribe(samples, sample_rate, language)` is async for every backend:
 cloud engines await HTTP natively; local GPU engines run their blocking
-inference in a worker thread behind a lock, so the event loop never blocks
-and the GPU processes one utterance at a time (queued requests wait in order).
+inference in a worker thread, so the event loop never blocks. At most
+`workers` utterances run at once; the rest wait in order.
 """
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ class STTBase(ABC):
 class LocalSTT(STTBase):
     """Base for in-process models: blocking inference off the event loop."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
+    def __init__(self, workers: int = 1) -> None:
+        self._slots = threading.Semaphore(workers)
 
     @abstractmethod
     def _transcribe_sync(self, samples: np.ndarray, language: str | None) -> dict:
@@ -47,6 +47,6 @@ class LocalSTT(STTBase):
         audio = to_16k(samples, sample_rate)
 
         def run() -> dict:
-            with self._lock:
+            with self._slots:
                 return self._transcribe_sync(audio, language)
         return await asyncio.to_thread(run)

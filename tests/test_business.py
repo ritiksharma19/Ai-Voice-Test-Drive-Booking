@@ -238,7 +238,8 @@ def test_costar_prompt_sections_and_calendar():
     assert "Reply only in Hindi" in prompt
     assert "Sat 26 Sep 2026 = 2026-09-26 (tomorrow)" in prompt
     assert "last slot starting 18:00" in prompt
-    assert prompt.rstrip().endswith("2026-10-08")          # date block last → cacheable prefix
+    # per-minute clock last, after the per-day calendar → longest cacheable prefix
+    assert prompt.rstrip().endswith("2026-10-08\nNow: Friday 25 September 2026, 12:00.")
 
 
 @pytest.mark.parametrize("text,expected", [

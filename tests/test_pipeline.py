@@ -19,6 +19,7 @@ from core.chunker import SpeechChunker
 from core.lang import detect_language, script_language
 from llm.base import LLMBackend
 from llm.orchestrator import AllProvidersFailed, LLMOrchestrator
+from llm.prompts import build_system_prompt
 from llm.retrieval import RetrievalService
 from llm.topic_guard import TopicGuard
 from stt.audio import encode_wav, parse_wav, to_16k
@@ -172,6 +173,21 @@ def test_failover_on_error_and_timeout():
         assert broken.calls == 1 and slow.calls == 1 and good.calls == 2
         hist = orch.conversations["s1"]
         assert [m["role"] for m in hist] == ["user", "assistant", "user", "assistant"]
+    asyncio.run(run())
+
+
+def test_warmup_primes_real_system_prompt():
+    class Recorder(FakeBackend):
+        async def stream(self, system, messages):
+            self.system = system
+            async for t in super().stream(system, messages):
+                yield t
+
+    async def run():
+        backend = Recorder("a")
+        orch = make_orchestrator(backend)
+        await orch.warmup()
+        assert backend.system.startswith(build_system_prompt(orch.s, "en", orch.bookings.now())[:500])
     asyncio.run(run())
 
 

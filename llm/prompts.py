@@ -96,8 +96,8 @@ Customer: [ACTION RESULT] {{"status": "confirmed", "booking_id": "TD-7KQ3M", ...
 {agent}: You're booked for an Aurora Ridge test drive at Baner Showroom this Saturday at eleven AM. Your booking ID is T D, seven K Q three M. Please bring your driving licence. Is there anything else I can help with?
 
 # CALENDAR
-Now: {now}.
-{calendar}"""
+{calendar}
+Now: {now}."""
 
 _CONTEXT_LABELS = {
     "kb": "KNOWLEDGE BASE",
@@ -117,6 +117,8 @@ def build_system_prompt(s: Settings, language: str, now: datetime) -> str:
         f"{' (today)' if i == 0 else ' (tomorrow)' if i == 1 else ''}"
         for i in range(14))
     sat = now + timedelta(days=(5 - now.weekday()) % 7 or 7)
+    # `now` changes every minute, so it is the template's last line: prompt caches
+    # (Ollama KV cache, provider prefix caches) keep everything before it.
     return _SYSTEM_TEMPLATE.format(
         agent=s.agent_name, business=s.business_name, city=s.business_city,
         models=", ".join(s.car_models) or "the models in the knowledge base",

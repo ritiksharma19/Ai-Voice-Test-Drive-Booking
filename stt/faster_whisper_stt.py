@@ -30,7 +30,7 @@ class FasterWhisperSTT(LocalSTT):
     name = "faster-whisper"
 
     def __init__(self, s: Settings) -> None:
-        super().__init__()
+        super().__init__(s.whisper_workers)
         register_cuda_dlls()
         from faster_whisper import WhisperModel  # type: ignore
 
@@ -47,7 +47,9 @@ class FasterWhisperSTT(LocalSTT):
 
         t0 = time.perf_counter()
         logger.info("Loading faster-whisper %s on %s (%s)…", self.model_name, self.device, compute_type)
-        self.model = WhisperModel(self.model_name, device=self.device, compute_type=compute_type)
+        # num_workers lets CTranslate2 run that many transcribe() calls in parallel.
+        self.model = WhisperModel(self.model_name, device=self.device, compute_type=compute_type,
+                                  num_workers=s.whisper_workers)
         self.multilingual = self.model.model.is_multilingual
 
         # Warm-up: first CUDA inference pays kernel/JIT setup (~0.5–2 s).

@@ -81,11 +81,15 @@ class LLMOrchestrator:
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def warmup(self) -> None:
-        """Warm every backend concurrently (TLS handshakes / model load)."""
+        """Warm every backend concurrently (TLS handshakes / model load / prompt cache)."""
+        system = build_system_prompt(self.s, "en", self.bookings.now())
+        # A CPU-only Ollama can need a minute or more to read the system prompt once.
+        timeout = max(60, self.s.llm_request_timeout)
+
         async def _one(b: LLMBackend) -> None:
             t0 = time.perf_counter()
             try:
-                await asyncio.wait_for(b.warmup(), timeout=60)
+                await asyncio.wait_for(b.warmup(system), timeout=timeout)
                 logger.info("✅ %s warm (%.0f ms)", b.describe(), (time.perf_counter() - t0) * 1000)
             except Exception as exc:
                 logger.warning("Warmup failed for %s: %s", b.describe(), exc)

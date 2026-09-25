@@ -247,6 +247,19 @@ class RetrievalService:
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
+    @property
+    def uses_local_kb(self) -> bool:
+        """True when KB_PROVIDER resolves to the local Markdown KB (uploads apply)."""
+        return self.s.kb_backend() == "local"
+
+    def reload_local_kb(self) -> int:
+        """Rebuild the local KB index after documents changed. Returns the chunk count."""
+        kb = LocalKnowledgeBase(self.s.kb_dir, self.s.kb_min_coverage)
+        self.local_kb = kb   # single assignment: in-flight searches keep the old index
+        self.kb_backend = "local" if kb.available else "off"
+        self._cache.clear()  # cached answers may be stale
+        return len(kb.chunks)
+
     async def warmup(self) -> None:
         if self.kb_backend == "discovery":
             try:
