@@ -20,21 +20,195 @@ The repository ships with a **sample fictional dealership** (Aurora Motors, Pune
 
 ## Contents
 
-1. [Architecture](#architecture)
-2. [How the dealership agent works](#how-the-dealership-agent-works)
-3. [Requirements](#requirements)
-4. [Installation (Windows + NVIDIA GPU)](#installation-windows--nvidia-gpu)
-5. [Configuration (.env)](#configuration-env)
-6. [Providers and model selection guide](#providers-and-model-selection-guide)
-7. [Cost](#cost)
-8. [Usage](#usage)
-9. [Voice activity detection (VAD)](#voice-activity-detection-vad)
-10. [Phone calls (Exotel)](#phone-calls-exotel)
-11. [Performance and latency](#performance-and-latency)
-12. [Benchmarking](#benchmarking)
-13. [Production deployment](#production-deployment)
-14. [Troubleshooting](#troubleshooting)
-15. [Project structure](#project-structure)
+1. [Quick start (first-time setup)](#quick-start-first-time-setup)
+2. [Run on a free cloud GPU (Lightning AI Studio + Cloudflare Tunnel)](#run-on-a-free-cloud-gpu-lightning-ai-studio--cloudflare-tunnel)
+3. [Architecture](#architecture)
+4. [How the dealership agent works](#how-the-dealership-agent-works)
+5. [Requirements](#requirements)
+6. [Installation (Windows + NVIDIA GPU)](#installation-windows--nvidia-gpu)
+7. [Configuration (.env)](#configuration-env)
+8. [Providers and model selection guide](#providers-and-model-selection-guide)
+9. [Cost](#cost)
+10. [Usage](#usage)
+11. [Voice activity detection (VAD)](#voice-activity-detection-vad)
+12. [Phone calls (Exotel)](#phone-calls-exotel)
+13. [Performance and latency](#performance-and-latency)
+14. [Benchmarking](#benchmarking)
+15. [Production deployment](#production-deployment)
+16. [Troubleshooting](#troubleshooting)
+17. [Project structure](#project-structure)
+
+---
+
+## Quick start (first-time setup)
+
+New to the project? These commands take you from nothing to a running agent. You need **Python 3.12** and **Git**. An NVIDIA GPU is optional but makes replies much faster.
+
+### 1. Get the code and install dependencies
+
+**Windows (PowerShell)**
+
+```powershell
+git clone https://github.com/ritiksharma19/Ai-Voice-Test-Drive-Booking.git
+cd Ai-Voice-Test-Drive-Booking
+
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1           # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install -r requirements-gpu.txt    # only if you have an NVIDIA GPU
+
+Copy-Item .env.example .env
+```
+
+**Linux / macOS (bash)**
+
+```bash
+git clone https://github.com/ritiksharma19/Ai-Voice-Test-Drive-Booking.git
+cd Ai-Voice-Test-Drive-Booking
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install -r requirements-gpu.txt    # only on Linux with an NVIDIA GPU
+
+cp .env.example .env
+```
+
+### 2. Choose an LLM (edit `.env`)
+
+Pick **one** option.
+
+**Option A: a cloud key (fastest, recommended).** Get a free Gemini key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) and set it in `.env`:
+
+```ini
+GEMINI_API_KEY="your-key"
+```
+
+**Option B: fully local with Ollama (no API keys).** Install [Ollama](https://ollama.com/download) (Windows: `winget install Ollama.Ollama`), pull a model, then point `.env` at it:
+
+```powershell
+ollama pull gemma3:4b                  # 12 GB+ GPU: gemma3:12b
+```
+
+```ini
+LLM_PROVIDER="ollama"
+LLM_FALLBACKS=""
+OLLAMA_MODEL="gemma3:4b"
+```
+
+> **CPU-only machines:** a local LLM can take a minute or more for the first reply, and about 10–30 s after that. Raise the timeouts so replies aren't cut off (`LLM_FIRST_TOKEN_TIMEOUT="180"`, `LLM_REQUEST_TIMEOUT="240"`). Also give Ollama room for the system prompt: set `OLLAMA_CONTEXT_LENGTH=8192` as an environment variable, then restart Ollama. For usable speed, use Option A or a GPU (see the [Lightning AI Studio](#run-on-a-free-cloud-gpu-lightning-ai-studio--cloudflare-tunnel) section below).
+
+### 3. Run it
+
+```powershell
+uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+Wait for `✅ Ready` in the log. The first start downloads the Whisper model: `small` (~500 MB) on CPU, `large-v3-turbo` (~1.6 GB) on GPU. Then open **http://localhost:8000**, click **Start Listening** and speak, or type in the chat box.
+
+Check that every engine loaded:
+
+```powershell
+curl http://localhost:8000/health
+```
+
+### 4. Next time
+
+```powershell
+cd Ai-Voice-Test-Drive-Booking
+.\.venv\Scripts\Activate.ps1           # Linux/macOS: source .venv/bin/activate
+uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+Stop the server with **Ctrl+C**. For all options, see [Installation](#installation-windows--nvidia-gpu) and [Configuration](#configuration-env).
+
+---
+
+## Run on a free cloud GPU (Lightning AI Studio + Cloudflare Tunnel)
+
+No NVIDIA GPU? [Lightning AI](https://lightning.ai) Studios are cloud Linux machines, and the free tier includes monthly GPU credits. On a GPU, Whisper `large-v3-turbo` and a local Gemma model reply in about a second. A free **Cloudflare quick tunnel** gives the Studio a public **HTTPS** URL. Browsers need HTTPS for microphone access, and Exotel needs `wss://`.
+
+### 1. Create the Studio
+
+1. Sign up at [lightning.ai](https://lightning.ai) and click **New Studio**.
+2. Open the machine selector (the chip icon in the right-hand panel) and switch to a **GPU** machine. **T4** or **L4** is enough.
+3. Open a **Terminal** in the Studio. Run all the commands below there.
+
+### 2. Install the app
+
+```bash
+git clone https://github.com/ritiksharma19/Ai-Voice-Test-Drive-Booking.git
+cd Ai-Voice-Test-Drive-Booking
+
+# Python 3.12 virtual environment (uv downloads 3.12 if the Studio has a different version)
+pip install -q uv
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt -r requirements-gpu.txt
+
+# Let CTranslate2 (Whisper) find the pip-installed cuBLAS / cuDNN libraries
+export LD_LIBRARY_PATH=$(python -c 'import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ":" + os.path.dirname(nvidia.cudnn.lib.__file__))'):$LD_LIBRARY_PATH
+
+# Should print 1 (or more). 0 means Whisper will fall back to the CPU.
+python -c "from config.device import cuda_device_count; print(cuda_device_count())"
+
+cp .env.example .env
+```
+
+Open `.env` in the Studio editor (or `nano .env`) and set an LLM, as in [Quick start step 2](#2-choose-an-llm-edit-env). To stay fully open-source, run Ollama on the GPU:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+nohup ollama serve > ollama.log 2>&1 &
+ollama pull gemma3:12b                 # fits a T4 (16 GB) or L4 (24 GB) next to Whisper
+```
+
+```ini
+LLM_PROVIDER="ollama"
+LLM_FALLBACKS=""
+OLLAMA_MODEL="gemma3:12b"
+```
+
+### 3. Start the server
+
+```bash
+nohup uvicorn server:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
+tail -f server.log                     # wait for "✅ Ready", then Ctrl+C to stop following
+curl http://localhost:8000/health      # "stt" should end in @cuda
+```
+
+### 4. Expose it with a Cloudflare quick tunnel
+
+No Cloudflare account is needed for a quick tunnel:
+
+```bash
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+chmod +x cloudflared
+./cloudflared tunnel --url http://localhost:8000
+```
+
+`cloudflared` prints a URL such as `https://random-words.trycloudflare.com`. Open it on any device. The microphone works because the URL is HTTPS, and WebSockets pass through the tunnel.
+
+- **Phone calls (Exotel):** use `wss://random-words.trycloudflare.com/telephony/exotel` as the stream URL, and set `EXOTEL_WS_TOKEN` (see [Phone calls](#phone-calls-exotel)).
+- **The URL changes** every time `cloudflared` restarts. For a fixed domain, create a named tunnel in your Cloudflare account (`cloudflared tunnel login`, then `cloudflared tunnel create voiceagent`).
+- **Share with care:** anyone with the URL can use your LLM and TTS credits. Stop the tunnel with **Ctrl+C** when you're done.
+
+### 5. Restarting after the Studio sleeps
+
+Studios stop when idle, and background processes stop with them. Your files and the venv are kept. After restarting the Studio:
+
+```bash
+cd Ai-Voice-Test-Drive-Booking
+source .venv/bin/activate
+export LD_LIBRARY_PATH=$(python -c 'import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ":" + os.path.dirname(nvidia.cudnn.lib.__file__))'):$LD_LIBRARY_PATH
+nohup ollama serve > ollama.log 2>&1 &          # only if you use Ollama
+nohup uvicorn server:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
+./cloudflared tunnel --url http://localhost:8000
+```
 
 ---
 
@@ -898,6 +1072,8 @@ These were measured on a CPU-only Windows laptop with no GPU and no LLM API keys
 | `No usable LLM provider` at startup | Set `LLM_PROVIDER` and its API key, or `LLM_PROVIDER=ollama` with Ollama running |
 | Every reply fails with "temporarily unavailable" | All providers in the chain failed; the log shows why (bad key, model name, network). Try `python scripts/benchmark.py components` |
 | Ollama: connection refused | Start Ollama (tray app or `ollama serve`) and `ollama pull <model>`; check `OLLAMA_HOST` |
+| `ollama: first-token timeout` in the log (CPU-only) | The CPU needs longer than `LLM_FIRST_TOKEN_TIMEOUT` to read the system prompt. Raise it to `180` and `LLM_REQUEST_TIMEOUT` to `240`, set `OLLAMA_CONTEXT_LENGTH=8192` for Ollama, or use a cloud key or a GPU ([Lightning AI Studio](#run-on-a-free-cloud-gpu-lightning-ai-studio--cloudflare-tunnel)) |
+| Lightning Studio: `libcublas.so.12` / `libcudnn` not found, or `/health` shows `@cpu` | Run the `export LD_LIBRARY_PATH=...` line from the Lightning section in the same terminal before starting uvicorn |
 | Hindi transcribed in Urdu script | Use `large-v3-turbo` (small models confuse the two), set `STT_LANGUAGE=hi`, or use `STT_PROVIDER=sarvam`. The reply is in Hindi either way |
 | Microphone does not work | Allow mic permission; use `http://localhost` or HTTPS |
 | No audio output | Click the page once (browsers need a user gesture before audio plays) |

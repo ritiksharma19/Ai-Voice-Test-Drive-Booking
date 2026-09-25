@@ -80,10 +80,6 @@ class LLMOrchestrator:
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
-    @property
-    def primary(self) -> LLMBackend:
-        return self.backends[0]
-
     async def warmup(self) -> None:
         """Warm every backend concurrently (TLS handshakes / model load)."""
         async def _one(b: LLMBackend) -> None:

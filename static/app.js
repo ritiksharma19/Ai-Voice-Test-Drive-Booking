@@ -50,8 +50,7 @@ let waveAnimId = null;
 
 // ── DOM refs (set in init) ─────────────────────────────────────────────────
 let connectionStatus, stateTag, statePrompt, orb, orbIcon,
-    toggleMicBtn, clearBtn, chatContainer, voiceSelect,
-    liveSubtitleContainer, liveSubtitle, chatForm, chatInput;
+    toggleMicBtn, clearBtn, chatContainer, voiceSelect, chatForm, chatInput;
 
 // ==========================================================================
 // INIT
@@ -75,8 +74,6 @@ function init() {
     clearBtn = document.getElementById("clear-btn");
     chatContainer = document.getElementById("chat-container");
     voiceSelect = document.getElementById("voice-select");
-    liveSubtitleContainer = document.getElementById("live-subtitle-container");
-    liveSubtitle = document.getElementById("live-subtitle");
     chatForm = document.getElementById("chat-form");
     chatInput = document.getElementById("chat-input");
 
@@ -811,15 +808,6 @@ function appendSystemMessage(text) {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
-
-function showLiveCaption(text) {
-    liveSubtitleContainer.classList.add("visible");
-    liveSubtitle.textContent = `"${text}"`;
-}
-
-function hideLiveCaption() {
-    liveSubtitleContainer.classList.remove("visible");
-}
 
 function scrollToBottom() {
     chatContainer.scrollTop = chatContainer.scrollHeight;

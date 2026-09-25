@@ -283,11 +283,6 @@
     @keyframes msgIn { from { opacity: 0; transform: translateY(4px); } }
     @keyframes spin  { to { transform: rotate(360deg); } }
 
-    #live-subtitle-container { display: none; padding: 10px 28px; border-top: 1px solid var(--border); }
-    #live-subtitle-container.visible { display: block; }
-    .subtitle-label { font-size: 12px; color: var(--text-dim); margin-bottom: 2px; }
-    #live-subtitle { font-size: 13px; color: var(--text-sub); font-style: italic; }
-
     .input-area { flex-shrink: 0; padding: 16px 28px 20px; }
     #chat-form {
         max-width: 760px; margin: 0 auto;
@@ -350,7 +345,6 @@
         .chat-header { padding: 12px 16px; }
         #chat-container { padding: 16px; gap: 16px; }
         .welcome-card { padding: 16px 8px; }
-        #live-subtitle-container { padding: 8px 16px; }
 
         .input-area {
             padding: 10px 16px calc(12px + env(safe-area-inset-bottom));
@@ -474,11 +468,6 @@
                     <h3>Hi, I'm VoiceAgent</h3>
                     <p>Ask about any of our cars (price, mileage, EV range, features) or book a free test drive or sales meeting. Talk in English or any of nine Indian languages, or type below.</p>
                 </div>
-            </div>
-
-            <div id="live-subtitle-container">
-                <div class="subtitle-label">Live caption</div>
-                <p id="live-subtitle">Listening…</p>
             </div>
 
             <div class="input-area">

@@ -175,7 +175,6 @@ class Settings:
     cors_origins: list[str] = field(default_factory=lambda: [
         o.strip() for o in _str("CORS_ORIGINS", "*").split(",") if o.strip()])
     max_audio_seconds: int = field(default_factory=lambda: _int("MAX_AUDIO_SECONDS", 30))
-    log_level: str = field(default_factory=lambda: _str("LOG_LEVEL", "INFO").upper())
 
     @property
     def discovery_configured(self) -> bool:
