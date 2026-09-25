@@ -153,10 +153,27 @@ class Settings:
     elevenlabs_model: str = field(default_factory=lambda: _str("ELEVENLABS_MODEL", "eleven_flash_v2_5"))
     elevenlabs_voice_id: str = field(default_factory=lambda: _str("ELEVENLABS_VOICE_ID", ""))
 
+    # ── VAD (browser end-of-speech pause; server-side VAD for phone calls) ────
+    vad_silence_ms: int = field(default_factory=lambda: _int("VAD_SILENCE_MS", 550))
+    vad_provider: str = field(default_factory=lambda: _str("VAD_PROVIDER", "silero").lower())
+    vad_threshold: float = field(default_factory=lambda: _float("VAD_THRESHOLD", 0.5))
+    vad_min_speech_ms: int = field(default_factory=lambda: _int("VAD_MIN_SPEECH_MS", 250))
+
+    # ── Telephony (Exotel) ───────────────────────────────────────────────────
+    exotel_ws_token: str = field(default_factory=lambda: _str("EXOTEL_WS_TOKEN"))
+    exotel_account_sid: str = field(default_factory=lambda: _str("EXOTEL_ACCOUNT_SID"))
+    exotel_api_key: str = field(default_factory=lambda: _str("EXOTEL_API_KEY"))
+    exotel_api_token: str = field(default_factory=lambda: _str("EXOTEL_API_TOKEN"))
+    exotel_subdomain: str = field(default_factory=lambda: _str("EXOTEL_SUBDOMAIN", "api.exotel.com"))
+    exotel_caller_id: str = field(default_factory=lambda: _str("EXOTEL_CALLER_ID"))
+    exotel_app_id: str = field(default_factory=lambda: _str("EXOTEL_APP_ID"))
+    # "" = "Hello! This is <AGENT_NAME> from <BUSINESS_NAME>…" | "off" = no greeting
+    telephony_greeting: str = field(default_factory=lambda: _str("TELEPHONY_GREETING"))
+    telephony_language: str = field(default_factory=lambda: _str("TELEPHONY_LANGUAGE", "en").lower())
+
     # ── Server ───────────────────────────────────────────────────────────────
     cors_origins: list[str] = field(default_factory=lambda: [
         o.strip() for o in _str("CORS_ORIGINS", "*").split(",") if o.strip()])
-    vad_silence_ms: int = field(default_factory=lambda: _int("VAD_SILENCE_MS", 550))
     max_audio_seconds: int = field(default_factory=lambda: _int("MAX_AUDIO_SECONDS", 30))
     log_level: str = field(default_factory=lambda: _str("LOG_LEVEL", "INFO").upper())
 

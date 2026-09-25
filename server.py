@@ -2,13 +2,14 @@
 server.py
 VoiceAgent — FastAPI server.
 
-Pipeline per user turn (one WebSocket per browser tab):
-  browser PCM WAV ─► STT ─► language ID ─► [knowledge base → Google, when needed]
+Pipeline per user turn (one WebSocket per browser tab or phone call):
+  browser PCM WAV / Exotel PCM stream + server VAD ─► STT ─► language ID ─► [knowledge base → Google, when needed]
                  ─► LLM stream (+ booking actions) ─► speech chunker ─► TTS ─► browser
 
   • Every heavy engine is created and warmed up in parallel at startup.
   • Each turn runs in its own asyncio.Task so barge-in cancels it instantly,
     including TTS requests that are still in flight.
+  • Phone calls (Exotel) arrive at /telephony/exotel; see telephony/exotel.py.
   • Per-turn stage timings are logged, sent to the client and aggregated at /metrics.
 """
 from __future__ import annotations
@@ -17,6 +18,7 @@ import asyncio
 import base64
 import hmac
 import json
+import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,14 +38,15 @@ from config.settings import get_settings  # noqa: E402
 setup_logging()
 logger = get_logger("server")
 
-from core import lang  # noqa: E402
-from core.chunker import SpeechChunker  # noqa: E402
+from core import lang, vad  # noqa: E402
 from core.http import close_http_client  # noqa: E402
 from core.metrics import STATS, TurnTimer  # noqa: E402
 from core.privacy import mask_pii  # noqa: E402
+from core.speech_stream import StreamingTTS  # noqa: E402
 from llm import AllProvidersFailed, LLMOrchestrator  # noqa: E402
 from stt import STTBase, build_stt_engine  # noqa: E402
 from stt.audio import parse_wav  # noqa: E402
+from telephony import exotel  # noqa: E402
 from tts import TTSRouter, build_tts_router  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -73,6 +76,7 @@ async def lifespan(app: FastAPI):
         engines.llm.warmup(),
         engines.tts.warmup(),
         asyncio.to_thread(lang.warmup),
+        asyncio.to_thread(vad.warmup, settings.vad_provider),   # phone-call VAD
         return_exceptions=True,
     )
     if isinstance(results[0], BaseException):
@@ -139,63 +143,51 @@ async def client_config():
 async def list_bookings(date: str | None = None, authorization: str = Header(default="")):
     """Bookings for staff. Disabled unless ADMIN_TOKEN is set; send
     'Authorization: Bearer <ADMIN_TOKEN>'. Contains customer phone numbers."""
+    if denied := _staff_denied(authorization):
+        return denied
+    return await asyncio.to_thread(engines.llm.bookings.list_bookings, date)
+
+
+def _staff_denied(authorization: str) -> JSONResponse | None:
+    """404 unless ADMIN_TOKEN is set; 401 unless 'Authorization: Bearer <ADMIN_TOKEN>'."""
     token = settings.admin_token
     if not token or not engines.llm:
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if not hmac.compare_digest(authorization.encode(), f"Bearer {token}".encode()):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-    return await asyncio.to_thread(engines.llm.bookings.list_bookings, date)
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# STREAMING TTS — ordered delivery, concurrent synthesis
+# TELEPHONY — Exotel Voicebot applet (bidirectional stream)
 # ────────────────────────────────────────────────────────────────────────────
 
-class StreamingTTS:
-    """
-    LLM text → SpeechChunker → one TTS task per segment (started immediately,
-    concurrency bounded by the router) → sent to the client strictly in order.
-    """
+@app.websocket("/telephony/exotel")
+async def exotel_stream(ws: WebSocket) -> None:
+    if not exotel.authorized(ws, settings.exotel_ws_token):
+        logger.warning("Exotel stream rejected: bad or missing token")
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    await exotel.ExotelCall(ws, engines, settings).run()
 
-    def __init__(self, ws: WebSocket, language: str, timer: TurnTimer) -> None:
-        self.ws, self.language, self.timer = ws, language, timer
-        self.chunker = SpeechChunker(settings.tts_first_chunk_min_chars,
-                                     settings.tts_first_chunk_max_chars)
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._pending: list[asyncio.Task] = []
-        self._sender = asyncio.create_task(self._send_loop())
 
-    def _dispatch(self, segments: list[str]) -> None:
-        for text in segments:
-            task = asyncio.create_task(engines.tts.synthesize(text, self.language))
-            self._pending.append(task)
-            self._queue.put_nowait((text, task))
-
-    def feed(self, text: str) -> None:
-        self._dispatch(self.chunker.feed(text))
-
-    async def finish(self) -> None:
-        self._dispatch(self.chunker.flush())
-        self._queue.put_nowait(None)
-        await self._sender
-
-    def cancel(self) -> None:
-        for task in (*self._pending, self._sender):
-            task.cancel()
-
-    async def _send_loop(self) -> None:
-        while (item := await self._queue.get()) is not None:
-            text, task = item
-            try:
-                speech = await task
-            except Exception as exc:
-                logger.error("TTS failed for %.40s: %r", text, exc)
-                continue
-            if speech is None:
-                continue
-            self.timer.mark("first_audio")
-            await self.ws.send_json({"type": "audio_chunk", "audio": speech.audio_b64,
-                                     "format": speech.fmt, "text": text})
+@app.post("/telephony/exotel/call", include_in_schema=False)
+async def exotel_outbound_call(body: dict, authorization: str = Header(default="")):
+    """Staff only: {"to": "+919876543210"} rings the customer and connects them
+    to the agent through the Exotel call flow EXOTEL_APP_ID."""
+    if denied := _staff_denied(authorization):
+        return denied
+    to = re.sub(r"[\s\-()]", "", str(body.get("to", "")))
+    if not re.fullmatch(r"\+?\d{10,15}", to):
+        return JSONResponse(status_code=422, content={"detail": "'to' must be a phone number"})
+    try:
+        return await exotel.place_call(settings, to)
+    except ValueError as exc:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+    except Exception as exc:
+        logger.error("Exotel outbound call failed: %r", exc)
+        return JSONResponse(status_code=502, content={"detail": "Exotel request failed"})
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -232,7 +224,12 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
     async def respond(user_text: str, language: str, timer: TurnTimer) -> None:
         await ws.send_json({"type": "status", "status": "thinking"})
-        tts = StreamingTTS(ws, language, timer)
+
+        async def emit(text: str, speech) -> None:
+            await ws.send_json({"type": "audio_chunk", "audio": speech.audio_b64,
+                                "format": speech.fmt, "text": text})
+
+        tts = StreamingTTS(engines.tts, emit, language, timer, settings)
         reply: list[str] = []
         source = "none"
         try:

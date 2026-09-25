@@ -8,6 +8,8 @@ A customer opens the dealership's website and talks. VoiceAgent answers question
 - **Bookings by voice:** test drives and sales meetings with real slot capacity, validation (mobile number, model, showroom, opening hours), no double-booking, SQLite storage and an optional CRM webhook
 - **CO-STAR prompt engineering:** a structured system prompt tuned for voice selling, with few-shot examples and guardrails against invented prices or fake bookings ([details](#prompt-engineering-co-star))
 - **Languages:** English, Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi
+- **Phone calls (Exotel):** customers can also call an Exotel number, or be called back, and talk to the same agent ([details](#phone-calls-exotel))
+- **Voice activity detection:** VAD in the browser, and Silero VAD on the server for phone audio, finds where each turn starts and ends ([details](#voice-activity-detection-vad))
 - **Barge-in:** start talking and the agent stops at once; in-flight LLM and TTS work is cancelled
 - **Provider failover:** Gemini, OpenAI, Claude or a local Ollama model; if one fails or is slow, the next one answers
 - **Built-in latency telemetry:** per-turn stage timings, a `/metrics` endpoint and a benchmark tool
@@ -26,11 +28,13 @@ The repository ships with a **sample fictional dealership** (Aurora Motors, Pune
 6. [Providers and model selection guide](#providers-and-model-selection-guide)
 7. [Cost](#cost)
 8. [Usage](#usage)
-9. [Performance and latency](#performance-and-latency)
-10. [Benchmarking](#benchmarking)
-11. [Production deployment](#production-deployment)
-12. [Troubleshooting](#troubleshooting)
-13. [Project structure](#project-structure)
+9. [Voice activity detection (VAD)](#voice-activity-detection-vad)
+10. [Phone calls (Exotel)](#phone-calls-exotel)
+11. [Performance and latency](#performance-and-latency)
+12. [Benchmarking](#benchmarking)
+13. [Production deployment](#production-deployment)
+14. [Troubleshooting](#troubleshooting)
+15. [Project structure](#project-structure)
 
 ---
 
@@ -97,7 +101,15 @@ flowchart TD
     B5 -->|"JSON text"| W1
     B4 -->|"JSON interrupt"| W1
 
-    subgraph SERVER["2 · WebSocket /ws · server.py"]
+    subgraph PHONE["1b · Phone call · telephony/exotel.py · core/vad.py"]
+        E1["Exotel Voicebot applet<br/>8 kHz 16-bit PCM over WebSocket"] --> E2["Server VAD<br/>Silero v6 ONNX, 32 ms frames"]
+        E2 -->|"pause ≥ VAD_SILENCE_MS"| E3["Utterance at 16 kHz"]
+        E2 -->|"caller talks over the agent"| E4["Barge-in: cancel turn,<br/>send clear"]
+    end
+
+    E3 --> W2
+
+    subgraph SERVER["2 · WebSocket /ws and /telephony/exotel · server.py"]
         W1["Session id · frame-size limit<br/>cancel the running turn on new input"] --> W2["One asyncio task per turn<br/>TurnTimer starts"]
     end
 
@@ -167,6 +179,7 @@ flowchart TD
 
     F1 --> T1
     T3 -->|"audio_chunk MP3"| B6["Browser plays chunks in order"]
+    T3 -->|"MP3 → PCM at the call rate"| E5["Exotel plays it to the caller"]
     K7 --> B6
 
     subgraph OPS["9 · Operations"]
@@ -423,7 +436,25 @@ Providers without a key are skipped with a warning. Edge TTS needs no key and is
 | `LLM_TEMPERATURE` | `0.3` | Ollama only; cloud reasoning models reject or ignore sampling parameters |
 | `LLM_FIRST_TOKEN_TIMEOUT` | `6` s | Fail over if no token arrives in time |
 | `TTS_FIRST_CHUNK_MIN_CHARS` / `_MAX_CHARS` | `24` / `70` | How early the first audio is cut |
-| `VAD_SILENCE_MS` | `550` | Browser end-of-speech pause (sent to the client via `/config`) |
+
+### Voice activity detection
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VAD_SILENCE_MS` | `550` | End-of-speech pause, for the browser (sent via `/config`) and for phone calls |
+| `VAD_PROVIDER` | `silero` | Server-side VAD for phone calls: `silero` (ONNX model bundled with faster-whisper) or `energy` (no model) |
+| `VAD_THRESHOLD` | `0.5` | Speech probability per 32 ms frame; raise it (0.6–0.7) on noisy lines |
+| `VAD_MIN_SPEECH_MS` | `250` | Speech needed before a turn starts or the caller interrupts the agent |
+
+### Telephony (Exotel)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EXOTEL_WS_TOKEN` | — | Shared secret for `/telephony/exotel`, sent as `?token=` or as the Basic-auth password. Without it the endpoint is open |
+| `TELEPHONY_GREETING` / `TELEPHONY_LANGUAGE` | *(auto)* / `en` | What the agent says when it answers; empty = "Hello! This is Priya from Aurora Motors…", `off` = silent |
+| `EXOTEL_ACCOUNT_SID` / `EXOTEL_API_KEY` / `EXOTEL_API_TOKEN` | — | Outbound calls only (Exotel dashboard → Settings → API) |
+| `EXOTEL_SUBDOMAIN` | `api.exotel.com` | `api.in.exotel.com` for accounts on the Mumbai cluster |
+| `EXOTEL_CALLER_ID` / `EXOTEL_APP_ID` | — | Outbound calls: your ExoPhone, and the call flow that contains the Voicebot applet |
 
 ---
 
@@ -656,7 +687,103 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 
 ### HTTP endpoints
 
-`GET /health` (engines loaded) · `GET /metrics` (latency percentiles) · `GET /config` (client settings, business and agent name) · `GET /ping` · `GET /bookings?date=YYYY-MM-DD` (staff only: needs `ADMIN_TOKEN`, returns 404 when unset)
+`GET /health` (engines loaded) · `GET /metrics` (latency percentiles) · `GET /config` (client settings, business and agent name) · `GET /ping` · `GET /bookings?date=YYYY-MM-DD` (staff only: needs `ADMIN_TOKEN`, returns 404 when unset) · `POST /telephony/exotel/call` (staff only: place an outbound call, see [Phone calls](#phone-calls-exotel)) · `WS /telephony/exotel` (Exotel audio stream)
+
+---
+
+## Voice activity detection (VAD)
+
+VAD decides when the customer has started and stopped talking. It sets how quickly the agent replies, and it makes barge-in work. Where it runs depends on the channel:
+
+| Channel | Where VAD runs | How |
+|---|---|---|
+| Browser | In the page (`static/app.js`) | RMS energy against a noise floor calibrated at start-up. After `VAD_SILENCE_MS` of silence, the utterance is sent as one WAV |
+| Phone (Exotel) | On the server (`core/vad.py`) | The call arrives as a continuous PCM stream. Each 32 ms frame is resampled to 16 kHz and scored by **Silero VAD v6**, a small ONNX model bundled with faster-whisper, so no PyTorch is needed. It costs ~0.1 ms of CPU per frame, and the model state is carried from frame to frame |
+| Every channel, before STT | `stt/audio.py` | Silero trims leading and trailing silence from the utterance. Pure noise returns nothing, so the STT model isn't run |
+
+The server-side VAD is a small state machine with hysteresis:
+
+```
+idle ── speech prob ≥ VAD_THRESHOLD for VAD_MIN_SPEECH_MS ──► speech_start   (barge-in if the agent is talking)
+speech ── prob < VAD_THRESHOLD − 0.15 for VAD_SILENCE_MS ──► speech_end     (utterance → STT)
+       └─ or MAX_AUDIO_SECONDS reached ──────────────────────► speech_end
+```
+
+- **Pre-roll:** 300 ms of audio before `speech_start` is kept, so the first syllable isn't cut off.
+- **Pauses mid-sentence:** if the caller pauses long enough to end a turn and then carries on before the agent has started speaking, the reply is cancelled. The two parts are then transcribed together as one utterance, so nothing is lost.
+- **Fallback:** `VAD_PROVIDER=energy` (or Silero failing to load) uses an RMS detector with an adaptive noise floor.
+
+**Tuning**
+
+| Symptom | Change |
+|---|---|
+| The agent cuts the caller off mid-sentence | Raise `VAD_SILENCE_MS` (700–900 on phone lines) |
+| Replies feel slow to start | Lower `VAD_SILENCE_MS` (450–500) |
+| Background noise or TV interrupts the agent | Raise `VAD_THRESHOLD` (0.6–0.7) and `VAD_MIN_SPEECH_MS` (350–400) |
+| Quiet speakers are missed | Lower `VAD_THRESHOLD` (0.35–0.4) |
+
+---
+
+## Phone calls (Exotel)
+
+Customers can talk to the same agent over a phone call. [Exotel](https://exotel.com)'s **Voicebot applet** streams the call audio to VoiceAgent over a WebSocket and plays back what the agent says. Knowledge base, Google fallback, bookings, languages and barge-in all work the same as in the browser.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Caller
+    participant E as Exotel
+    participant V as VoiceAgent /telephony/exotel
+    C->>E: Dials your ExoPhone (or is called back)
+    E->>V: connected, start {call_sid, media_format: 8000 Hz}
+    V->>E: media: greeting (PCM) + mark
+    loop every turn
+        C->>E: speaks
+        E->>V: media: base64 16-bit PCM
+        V->>V: Silero VAD → speech_end → STT → LLM → TTS
+        V->>E: media: reply PCM (≥ 3.2 KB chunks) + mark
+    end
+    C->>E: talks over the agent
+    V->>E: clear (drop queued audio; the turn is cancelled)
+    E->>V: stop
+```
+
+### Inbound calls (customers call you)
+
+1. Deploy VoiceAgent on a public **HTTPS** host, because Exotel connects over `wss://` (see [Production deployment](#production-deployment)). For a quick test, `cloudflared tunnel --url http://localhost:8000` works.
+2. Set `EXOTEL_WS_TOKEN` in `.env` to a long random string.
+3. In the Exotel dashboard, open **App Bazaar**, create a call flow and add a **Voicebot** applet with this URL:
+   ```
+   wss://your.domain/telephony/exotel?sample-rate=8000&token=<EXOTEL_WS_TOKEN>
+   ```
+   `sample-rate` can be `8000` (standard phone audio), `16000` or `24000`. Higher rates give the STT clearer audio if your Exotel account supports them. You can also put the token in the URL as Basic auth (`wss://agent:<token>@your.domain/telephony/exotel`).
+4. Assign the call flow to your ExoPhone and call it. The agent answers with `TELEPHONY_GREETING`.
+
+The log shows `Call started | session=exotel-<CallSid> | from=******3210 | 8000 Hz | vad=silero`, then one `CALLER` / `BOT` line per turn with stage timings. Per-turn timings also go to `/metrics`.
+
+### Outbound calls (the agent calls the customer)
+
+Set the `EXOTEL_*` API settings and `ADMIN_TOKEN`. Then:
+
+```powershell
+curl -X POST http://localhost:8000/telephony/exotel/call `
+     -H "Authorization: Bearer <ADMIN_TOKEN>" -H "Content-Type: application/json" `
+     -d '{\"to\": \"+919876543210\"}'
+# {"call_sid":"c5797dcb…","status":"in-progress"}
+```
+
+Exotel rings the customer. When they answer, Exotel connects them to the call flow `EXOTEL_APP_ID`, whose Voicebot applet streams to `/telephony/exotel`. The request is deliberately not retried, so a timeout can never ring the customer twice. Follow Exotel's and TRAI's rules for outbound and promotional calls (DND, calling hours, consent).
+
+### How audio is handled
+
+| Direction | Format | Conversion |
+|---|---|---|
+| Exotel → agent | raw 16-bit mono PCM (slin), base64, at the call's sample rate | Stream-resampled to 16 kHz → VAD → STT |
+| Agent → Exotel | the same | TTS MP3 is decoded and resampled with PyAV (installed with faster-whisper, no ffmpeg). It is sent in ~100 ms chunks of at least 3.2 KB, in multiples of 320 bytes, as Exotel requires |
+
+Barge-in uses Exotel's `clear` event. After each reply the agent sends a `mark`. When Exotel echoes the mark back, playback is known to be finished. Until then the agent uses the audio's duration as an estimate.
+
+**Phone-call tips:** 8 kHz audio is harder for STT than browser audio. Use `large-v3-turbo` Whisper or Sarvam `saaras:v3` rather than a small Whisper model. Callers pause more on the phone, so `VAD_SILENCE_MS=700` is a good starting point.
 
 ---
 
@@ -749,6 +876,7 @@ These were measured on a CPU-only Windows laptop with no GPU and no LLM API keys
   ```
 - **HTTPS is required** for microphone access anywhere except `localhost`. Put a reverse proxy in front (Caddy, Nginx, IIS with the WebSocket module) or use `cloudflared tunnel --url http://localhost:8000` for quick sharing.
 - **Lock down CORS:** `CORS_ORIGINS=https://your.domain`.
+- **Telephony:** Exotel needs a public `wss://` URL with a valid TLS certificate, and the proxy must pass WebSocket upgrades on `/telephony/exotel`. Always set `EXOTEL_WS_TOKEN`, because an open stream endpoint lets anyone spend your LLM and TTS credits. Each call holds one WebSocket and one turn at a time, so size `LLM_MAX_CONCURRENCY` and `TTS_MAX_CONCURRENCY` for your peak concurrent calls.
 - **Windows service:** run under [NSSM](https://nssm.cc) or Task Scheduler with the venv's `python.exe -m uvicorn ...` and the project folder as working directory.
 - **Secrets:** inject API keys as environment variables from your secret store; `.env` is for development.
 - **Health and monitoring:** `/health` returns 503 until all engines are loaded (use it for readiness probes). Scrape `/metrics` for latency SLOs. Logs rotate in `logs/voiceagent.log` (10 MB × 5).
@@ -781,6 +909,10 @@ These were measured on a CPU-only Windows laptop with no GPU and no LLM API keys
 | Booking says the slot is invalid | Slots start every `BOOKING_SLOT_MINUTES` from opening time, at least `BOOKING_MIN_LEAD_MINUTES` ahead; check `BUSINESS_HOURS`, `BUSINESS_DAYS` and `BUSINESS_TIMEZONE` |
 | Test drive refused for a model you sell | Add it to `CAR_MODELS` |
 | Knowledge base errors | `pip install -r requirements-kb.txt`; `gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`; check `GCP_PROJECT_ID` / `GCP_DATA_STORE_ID` |
+| Exotel call connects but the agent is silent | Check the log for `Call started`. If it's missing, the applet URL or token is wrong (`Exotel stream rejected`); the URL must be `wss://` on a public host |
+| Phone agent cuts callers off, or never replies | Tune `VAD_SILENCE_MS`, `VAD_THRESHOLD` and `VAD_MIN_SPEECH_MS` (see [VAD tuning](#voice-activity-detection-vad)) |
+| `Silero VAD unavailable` in the log | `pip install faster-whisper` (it bundles the model and onnxruntime); the energy VAD is used meanwhile |
+| Outbound call returns 503 | The response names the missing `EXOTEL_*` settings |
 | PowerShell won't activate the venv | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 
 Set `LOG_LEVEL=DEBUG` for detailed logs.
@@ -791,13 +923,15 @@ Set `LOG_LEVEL=DEBUG` for detailed logs.
 
 ```
 VoiceAgent/
-├── server.py                 FastAPI app: WebSocket pipeline, streaming TTS, /health /metrics /config /bookings
+├── server.py                 FastAPI app: WebSocket pipeline, Exotel routes, /health /metrics /config /bookings
 ├── config/
 │   ├── settings.py           All environment configuration (single source of truth)
 │   ├── device.py             CUDA detection + Windows cuBLAS/cuDNN DLL registration
 │   └── logging_config.py     Console + rotating file logging (Windows-safe)
 ├── core/
 │   ├── chunker.py            Streaming text → speakable segments
+│   ├── speech_stream.py      Concurrent TTS per segment, delivered in order (browser + phone)
+│   ├── vad.py                Streaming server-side VAD (Silero ONNX / energy) for phone audio
 │   ├── lang.py               Script-based language ID, speech text cleanup
 │   ├── http.py               Shared async HTTP client + retry/429 handling
 │   ├── metrics.py            Per-turn timers and rolling percentiles
@@ -825,9 +959,12 @@ VoiceAgent/
 ├── tts/
 │   ├── __init__.py           TTS router: per-language chain, fallback, cache
 │   ├── sarvam.py · cloud_tts.py (OpenAI, ElevenLabs) · edge_tts_engine.py
+├── telephony/
+│   ├── exotel.py             Exotel Voicebot stream: call session, barge-in, outbound calls
+│   └── audio.py              MP3 → phone PCM (PyAV), Exotel-sized chunks
 ├── static/                   index.html + app.js (browser client)
 ├── scripts/benchmark.py      Component and end-to-end latency benchmarks
-├── tests/                    60 offline tests: pipeline, WebSocket, KB, guardrail, booking, prompt (python -m pytest)
+├── tests/                    69 offline tests: pipeline, WebSocket, telephony + VAD, KB, guardrail, booking, prompt (python -m pytest)
 ├── requirements*.txt         core · gpu · kb · seamless
 └── .env.example
 ```

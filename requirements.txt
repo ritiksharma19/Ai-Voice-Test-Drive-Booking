@@ -26,7 +26,7 @@ ollama>=0.5
 
 # ── Speech ──────────────────────────────────────────────
 numpy>=1.26
-faster-whisper>=1.1          # Whisper on CTranslate2 (CUDA / CPU) + bundled Silero VAD (ONNX)
+faster-whisper>=1.1          # Whisper (CUDA / CPU) + Silero VAD (ONNX) + PyAV (MP3 → phone PCM)
 edge-tts>=7.0                # free neural voices, universal TTS fallback
 lingua-language-detector>=2.0   # Hindi vs Marathi disambiguation (Devanagari)
 
