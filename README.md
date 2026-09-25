@@ -34,6 +34,7 @@ The repository ships with a **sample fictional dealership** (Aurora Motors, Pune
 10. [Usage](#usage)
 11. [Voice activity detection (VAD)](#voice-activity-detection-vad)
 12. [Phone calls (Exotel)](#phone-calls-exotel)
+    - [Exotel setup (step by step)](#exotel-setup-step-by-step)
 13. [Performance and latency](#performance-and-latency)
 14. [Benchmarking](#benchmarking)
 15. [Production deployment](#production-deployment)
@@ -127,6 +128,8 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 Stop the server with **Ctrl+C**. For all options, see [Installation](#installation-windows--nvidia-gpu) and [Configuration](#configuration-env).
+
+**Phone calls:** to let customers call the agent, or to use the **Call me back** button, follow [Exotel setup (step by step)](#exotel-setup-step-by-step).
 
 ---
 
@@ -842,7 +845,7 @@ Assumed GPU time per turn: Whisper `large-v3-turbo` ≈ 0.3 s for a 5 s clip on 
 
 **Text:** type into the chat box. The reply is streamed and spoken the same way.
 
-**Call me back:** the customer clicks **Call me back** and enters a mobile number, and the AI agent phones them through Exotel. The call is the same agent as in the browser: it can answer questions and book test drives. The button is always shown (set `CALLBACK_ENABLED=false` to hide it). Calls go out only once the outbound `EXOTEL_*` settings are complete (see [Outbound calls](#outbound-calls-the-agent-calls-the-customer)); until then the dialog tells the customer that call-backs aren't available. Because anyone on the page can use it, requests are limited per number (`CALLBACK_NUMBER_COOLDOWN_MIN`), per visitor (`CALLBACK_PER_CLIENT_PER_HOUR`) and in total (`CALLBACK_PER_HOUR`). The page also needs `ACCESS_TOKEN` when one is set.
+**Call me back:** the customer clicks **Call me back** and enters a mobile number, and the AI agent phones them through Exotel. The call is the same agent as in the browser: it can answer questions and book test drives. The button is always shown (set `CALLBACK_ENABLED=false` to hide it). Calls go out only once the outbound `EXOTEL_*` settings are complete (see [Exotel setup](#exotel-setup-step-by-step)); until then the dialog tells the customer that call-backs aren't available. Because anyone on the page can use it, requests are limited per number (`CALLBACK_NUMBER_COOLDOWN_MIN`), per visitor (`CALLBACK_PER_CLIENT_PER_HOUR`) and in total (`CALLBACK_PER_HOUR`). The page also needs `ACCESS_TOKEN` when one is set.
 
 **Upload knowledge base documents:** click **Docs** and drop in `.md`, `.txt` or `.pdf` files with price lists, offers or policies. They are saved as text in `data/knowledge_base/uploads/`, and the index is rebuilt at once, so the next question can use them. Long documents are split into sections of about 1,200 characters. Uploaded files can be deleted from the same dialog; the built-in files are edited in the repository. Markdown with `#` headings gives the best answers, because each heading becomes a searchable section. Scanned PDFs have no text layer and must be run through OCR first. Uploads apply to the local knowledge base only, not to Discovery Engine, and the `uploads/` folder is git-ignored because it may hold confidential documents. **Anyone who can open the page can upload and delete documents**, and so change what the agent tells customers (prices, offers). Before sharing a public URL, set `ACCESS_TOKEN`; uploads then need the same `?token=` link as the chat.
 
@@ -941,22 +944,111 @@ sequenceDiagram
     E->>V: stop
 ```
 
+### Exotel setup (step by step)
+
+Do this once. It enables all three phone features: **inbound calls** (customers dial your number), **outbound calls** (staff make the agent call someone) and the **Call me back** button on the web page.
+
+**What you need:** an Exotel account with an ExoPhone, VoiceAgent running, and a public HTTPS address for it (a Cloudflare tunnel is fine for testing).
+
+#### 1. Create the Exotel account and get a number
+
+1. Sign up at [exotel.com](https://exotel.com) and log in to the dashboard at [my.exotel.com](https://my.exotel.com).
+2. Complete **KYC** (business documents). Indian telecom rules require it before numbers and calls are activated.
+3. Buy an **ExoPhone**, the virtual number that customers call and that shows as the caller ID when the agent calls out.
+
+Trial accounts are usually limited, for example to calling only numbers you have verified. Check with Exotel before a real launch.
+
+#### 2. Copy the API credentials into `.env`
+
+In the dashboard open **Settings → API**. Copy the values into `.env`:
+
+```ini
+EXOTEL_ACCOUNT_SID="..."        # "Account SID"
+EXOTEL_API_KEY="..."            # "API Key"
+EXOTEL_API_TOKEN="..."          # "API Token"
+EXOTEL_SUBDOMAIN="api.exotel.com"   # use api.in.exotel.com if the API page shows the Mumbai cluster
+EXOTEL_CALLER_ID="..."          # your ExoPhone, e.g. 08047112345
+```
+
+Never commit `.env`; it is already in `.gitignore`.
+
+#### 3. Choose the stream secret
+
+Exotel connects to VoiceAgent over a WebSocket. Protect it with a long random string, so nobody else can connect and use your LLM and TTS credits:
+
+```ini
+EXOTEL_WS_TOKEN="a-long-random-string"
+```
+
+Generate one with `python -c "import secrets; print(secrets.token_urlsafe(24))"`.
+
+#### 4. Give VoiceAgent a public address
+
+Exotel must reach your server over `wss://` with a valid certificate. `localhost` is not reachable from Exotel.
+
+- **Testing:** start a Cloudflare quick tunnel (no Cloudflare account needed):
+  ```powershell
+  winget install --id Cloudflare.cloudflared -e     # Windows; Linux: see the Lightning AI section
+  cloudflared tunnel --url http://localhost:8000
+  ```
+  It prints an address such as `https://random-words.trycloudflare.com`. The address changes every time the tunnel restarts, so you then have to update the applet URL in step 5.
+- **Production:** use your own domain with a reverse proxy, or a named Cloudflare tunnel (see [Production deployment](#production-deployment)).
+
+#### 5. Build the call flow with a Voicebot applet
+
+1. In the dashboard open **App Bazaar** and create a new call flow (app). Name it, for example, `VoiceAgent`.
+2. Add a **Voicebot** applet. If it isn't listed, ask Exotel support to enable Voicebot (streaming) on your account.
+3. Set the applet URL to your public address, with the path, sample rate and stream secret:
+   ```
+   wss://random-words.trycloudflare.com/telephony/exotel?sample-rate=8000&token=<EXOTEL_WS_TOKEN>
+   ```
+   `sample-rate` can be `8000` (standard phone audio), `16000` or `24000`; higher rates give the STT clearer audio if your account supports them. The token can instead go in the URL as Basic auth: `wss://agent:<token>@your.domain/telephony/exotel`.
+4. Optionally add a **Hangup** applet after it, then save the flow.
+5. Copy the flow's **app ID** (shown in the App Bazaar list and in the flow's URL) into `.env`:
+   ```ini
+   EXOTEL_APP_ID="123456"
+   ```
+
+#### 6. Connect the flow to your number (inbound calls)
+
+Open **ExoPhones**, pick your number and set its call flow to the one from step 5. Calls to that number now go to VoiceAgent. Skip this step if you only want the agent to call out.
+
+#### 7. Restart and check
+
+Restart VoiceAgent so it reads the new `.env`, then check:
+
+```powershell
+curl http://localhost:8000/config
+# ... "callback_ready": true ...   <- all outbound settings found
+```
+
+- **Inbound:** call your ExoPhone from your mobile. The agent answers with `TELEPHONY_GREETING`. The log shows `Call started | session=exotel-<CallSid> | from=******3210 | 8000 Hz | vad=silero`, then one `CALLER` / `BOT` line per turn.
+- **Call me back:** open the web page, click **Call me back** and enter your mobile number. Your phone should ring within a few seconds.
+- **Outbound from a script:** see [Outbound calls](#outbound-calls-the-agent-calls-the-customer).
+
+#### 8. Before sharing the page publicly
+
+Set `ACCESS_TOKEN` in `.env` and share the page as `https://your.address/?token=<ACCESS_TOKEN>`. Without it, anyone with the address can chat, upload documents and request calls to any number. Exotel's own connection uses `EXOTEL_WS_TOKEN`, so it is not affected.
+
+#### Exotel troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `callback_ready` is `false` | One of `EXOTEL_ACCOUNT_SID`, `EXOTEL_API_KEY`, `EXOTEL_API_TOKEN`, `EXOTEL_CALLER_ID`, `EXOTEL_APP_ID` is empty, or the server was not restarted |
+| **Call me back** says "We couldn't place the call" | The log shows `Exotel HTTP <code>`. 401 = wrong key or token; 404 = wrong `EXOTEL_SUBDOMAIN` or SID; trial accounts may only call verified numbers |
+| Phone rings, then silence or hang-up | Exotel could not reach the applet URL: the tunnel stopped, its address changed, or the path is not `/telephony/exotel`. The log shows `Exotel stream rejected` when the token is wrong |
+| Calling the ExoPhone plays Exotel's default message | The number is not connected to the flow (step 6) |
+| Agent cuts callers off, or never replies | Tune `VAD_SILENCE_MS`, `VAD_THRESHOLD` and `VAD_MIN_SPEECH_MS` (see [VAD](#voice-activity-detection-vad)) |
+
+Follow Exotel's and TRAI's rules for outbound calls: consent, DND registry and calling hours.
+
 ### Inbound calls (customers call you)
 
-1. Deploy VoiceAgent on a public **HTTPS** host, because Exotel connects over `wss://` (see [Production deployment](#production-deployment)). For a quick test, `cloudflared tunnel --url http://localhost:8000` works.
-2. Set `EXOTEL_WS_TOKEN` in `.env` to a long random string.
-3. In the Exotel dashboard, open **App Bazaar**, create a call flow and add a **Voicebot** applet with this URL:
-   ```
-   wss://your.domain/telephony/exotel?sample-rate=8000&token=<EXOTEL_WS_TOKEN>
-   ```
-   `sample-rate` can be `8000` (standard phone audio), `16000` or `24000`. Higher rates give the STT clearer audio if your Exotel account supports them. You can also put the token in the URL as Basic auth (`wss://agent:<token>@your.domain/telephony/exotel`).
-4. Assign the call flow to your ExoPhone and call it. The agent answers with `TELEPHONY_GREETING`.
-
-The log shows `Call started | session=exotel-<CallSid> | from=******3210 | 8000 Hz | vad=silero`, then one `CALLER` / `BOT` line per turn with stage timings. Per-turn timings also go to `/metrics`.
+Once the setup above is done, customers call your ExoPhone and talk to the agent. Knowledge base, Google fallback, bookings, languages and barge-in work as in the browser. Per-turn timings go to the log and to `/metrics`.
 
 ### Outbound calls (the agent calls the customer)
 
-Set the `EXOTEL_*` API settings and `ADMIN_TOKEN`. Then:
+Staff can make the agent call someone. This needs `ADMIN_TOKEN` in addition to the settings above:
 
 ```powershell
 curl -X POST http://localhost:8000/telephony/exotel/call `
@@ -965,37 +1057,11 @@ curl -X POST http://localhost:8000/telephony/exotel/call `
 # {"call_sid":"c5797dcb…","status":"in-progress"}
 ```
 
-Exotel rings the customer. When they answer, Exotel connects them to the call flow `EXOTEL_APP_ID`, whose Voicebot applet streams to `/telephony/exotel`. The request is deliberately not retried, so a timeout can never ring the customer twice. Follow Exotel's and TRAI's rules for outbound and promotional calls (DND, calling hours, consent).
+Exotel rings the customer. When they answer, Exotel connects them to the call flow `EXOTEL_APP_ID`, whose Voicebot applet streams to `/telephony/exotel`. The request is deliberately not retried, so a timeout can never ring the customer twice.
 
-### Set up the "Call me back" button (step by step)
+### "Call me back" button
 
-The button on the web page asks for the customer's mobile number, and the agent calls them. It uses the outbound call above, so it needs an Exotel account and a public URL.
-
-1. **Exotel account:** sign up at [exotel.com](https://exotel.com) and get an **ExoPhone** (the number customers see).
-2. **API credentials:** in the Exotel dashboard go to **Settings → API**, and copy the Account SID, API key and API token into `.env`:
-   ```ini
-   EXOTEL_ACCOUNT_SID="..."
-   EXOTEL_API_KEY="..."
-   EXOTEL_API_TOKEN="..."
-   EXOTEL_CALLER_ID="..."      # your ExoPhone
-   EXOTEL_SUBDOMAIN="api.exotel.com"   # api.in.exotel.com for the Mumbai cluster
-   EXOTEL_WS_TOKEN="a-long-random-string"
-   ```
-3. **Public URL:** Exotel must reach your server over `wss://`. For testing, use a Cloudflare quick tunnel:
-   ```powershell
-   winget install --id Cloudflare.cloudflared -e     # Windows; Linux: see the Lightning AI section
-   cloudflared tunnel --url http://localhost:8000
-   ```
-   It prints an address such as `https://random-words.trycloudflare.com`. The address changes every time the tunnel restarts, so update the call flow (next step) when it does.
-4. **Call flow:** in **App Bazaar**, create a call flow with a **Voicebot** applet whose URL is
-   ```
-   wss://random-words.trycloudflare.com/telephony/exotel?sample-rate=8000&token=<EXOTEL_WS_TOKEN>
-   ```
-   Save it and copy the flow's app ID into `.env` as `EXOTEL_APP_ID`.
-5. **Protect the public page:** set `ACCESS_TOKEN` in `.env` and share the page as `https://random-words.trycloudflare.com/?token=<ACCESS_TOKEN>`. Without it, anyone with the address can use the chat, upload documents and request calls. Exotel's connection uses `EXOTEL_WS_TOKEN`, so it is not affected.
-6. **Restart** the server. `GET /config` now shows `"callback_ready": true`, and **Call me back** rings the number that is entered. Until all five outbound values are set, the dialog says call-backs aren't set up yet.
-
-Limits against abuse: one call per number every `CALLBACK_NUMBER_COOLDOWN_MIN` (10) minutes, `CALLBACK_PER_CLIENT_PER_HOUR` (3) per visitor, and `CALLBACK_PER_HOUR` (20) in total. Follow TRAI's rules for calling hours and consent.
+The customer enters a mobile number on the web page and the agent calls them, using the same outbound call. The button is always shown (hide it with `CALLBACK_ENABLED=false`). Until the outbound settings are complete, the dialog says call-backs aren't set up yet. Abuse limits: one call per number every `CALLBACK_NUMBER_COOLDOWN_MIN` (10) minutes, `CALLBACK_PER_CLIENT_PER_HOUR` (3) per visitor and `CALLBACK_PER_HOUR` (20) in total.
 
 ### How audio is handled
 
