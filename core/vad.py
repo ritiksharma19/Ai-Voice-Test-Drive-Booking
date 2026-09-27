@@ -152,6 +152,7 @@ class StreamingVAD:
         self._speech_run = self._silence_run = 0
         self.in_speech = False
 
+    # FLOW P4a: resample to 16 kHz, split into 32 ms frames, score each, run _step.
     def feed(self, samples: np.ndarray) -> list[VADEvent]:
         """`samples`: float32 mono in [-1, 1] at the constructor's sample rate."""
         self._pending = np.concatenate([self._pending, self._resample(samples)])
@@ -164,6 +165,7 @@ class StreamingVAD:
                 events.append(event)
         return events
 
+    # FLOW P4b: turn-taking state machine: silence → speech_start → speech_end.
     def _step(self, frame: np.ndarray, prob: float) -> VADEvent | None:
         self._frames.append(frame)
         if not self.in_speech:

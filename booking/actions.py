@@ -29,6 +29,7 @@ class ActionFilter:
         self._payload: list[str] = []
         self.raw_tag = ""            # the full <action>…</action> text, for history
 
+    # FLOW L9: called with every LLM text chunk.
     def feed(self, text: str) -> str:
         """Speakable part of `text` (may be '' while a possible tag is buffered)."""
         if self._done:

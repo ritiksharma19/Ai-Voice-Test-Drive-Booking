@@ -281,6 +281,7 @@ class RetrievalService:
     def mentions_business(self, query: str) -> bool:
         return bool(self._business_terms & set(tokenize(query)))
 
+    # FLOW L4 (called from LLMOrchestrator.stream_reply).
     def plan(self, query: str, booking_active: bool = False,
              allow_web: bool = True) -> tuple[str, ...]:
         """Sources in the order they are tried: () | ("kb",) | ("web",) | ("kb", "web").
@@ -304,6 +305,7 @@ class RetrievalService:
 
     # ── public ────────────────────────────────────────────────────────────────
 
+    # FLOW L5: cache → in-flight dedupe → _retrieve → _kb_then_web.
     async def get_context(self, query: str, wait: float | None = None,
                           sources: tuple[str, ...] | None = None) -> dict:
         """Best context available within `wait` seconds for `query` (the text
@@ -345,6 +347,7 @@ class RetrievalService:
         self._cache_put(key, result)
         return result
 
+    # FLOW L5a: knowledge base first; web search only when the KB has no good answer.
     async def _kb_then_web(self, query: str, sources: tuple[str, ...]) -> dict:
         kb_task = web_task = None
         try:

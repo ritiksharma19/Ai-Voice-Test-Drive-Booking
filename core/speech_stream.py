@@ -31,15 +31,18 @@ class StreamingTTS:
         self._pending: list[asyncio.Task] = []
         self._sender = asyncio.create_task(self._send_loop())
 
+    # FLOW T3: start synthesis now (TTSRouter.synthesize) and queue it in speaking order.
     def _dispatch(self, segments: list[str]) -> None:
         for text in segments:
             task = asyncio.create_task(self.tts.synthesize(text, self.language))
             self._pending.append(task)
             self._queue.put_nowait((text, task))
 
+    # FLOW T2: LLM text → SpeechChunker.feed → _dispatch.
     def feed(self, text: str) -> None:
         self._dispatch(self.chunker.feed(text))
 
+    # FLOW T5: end of reply — flush the chunker, then wait for the sender.
     async def finish(self) -> None:
         self._dispatch(self.chunker.flush())
         self._queue.put_nowait(None)
@@ -49,6 +52,7 @@ class StreamingTTS:
         for task in (*self._pending, self._sender):
             task.cancel()
 
+    # FLOW T4: await each TTS task in order and hand the audio to emit().
     async def _send_loop(self) -> None:
         while (item := await self._queue.get()) is not None:
             text, task = item

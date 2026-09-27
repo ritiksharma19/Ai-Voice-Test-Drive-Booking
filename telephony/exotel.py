@@ -86,6 +86,7 @@ class ExotelCall:
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
+    # FLOW P2: read Exotel events until the call ends.
     async def run(self) -> None:
         try:
             while True:
@@ -118,6 +119,7 @@ class ExotelCall:
                 self.engines.llm.release_session(self.session_id)
             logger.info("Call disconnected | session=%s", self.session_id)
 
+    # FLOW P3: call metadata → create the VAD → speak the greeting.
     async def _on_start(self, msg: dict) -> None:
         start = msg.get("start") or {}
         self.stream_sid = msg.get("stream_sid") or start.get("stream_sid", "")
@@ -136,12 +138,14 @@ class ExotelCall:
         if self.s.telephony_greeting.lower() != "off":
             self._start_task(self.say(greeting(self.s), self.s.telephony_language))
 
+    # FLOW P4: every chunk of caller audio goes through the VAD (core/vad.py).
     async def _on_media(self, media: dict) -> None:
         if self.vad is None or not media.get("payload"):
             return
         for event in self.vad.feed(pcm16_to_float(base64.b64decode(media["payload"]))):
             await self._on_vad(event)
 
+    # FLOW P5: speech_start = possible barge-in; speech_end = finished utterance → _turn.
     async def _on_vad(self, event: VADEvent) -> None:
         if event.kind == "speech_start":
             if self.current and not self.current.done():
@@ -177,6 +181,7 @@ class ExotelCall:
                 pass
         self.current = None
 
+    # FLOW P6: same pipeline as the browser: STT → stream_reply → StreamingTTS(emit=_play).
     async def _turn(self, audio: np.ndarray) -> None:
         self._turn_audio = audio
         timer = TurnTimer()
@@ -226,6 +231,7 @@ class ExotelCall:
 
     # ── audio out ─────────────────────────────────────────────────────────────
 
+    # FLOW P7: TTS audio → PCM at the call's sample rate → Exotel media messages.
     async def _play(self, text: str, speech: Speech) -> None:
         try:
             pcm = await asyncio.to_thread(decode_to_pcm16, base64.b64decode(speech.audio_b64),
@@ -242,6 +248,7 @@ class ExotelCall:
         seconds = len(pcm) / (self.sample_rate * BYTES_PER_SAMPLE)
         self._playback_until = max(time.monotonic(), self._playback_until) + seconds
 
+    # FLOW P8: Exotel echoes this mark when playback finishes (resets _playback_until).
     async def _send_mark(self) -> None:
         self._marks += 1
         self._last_mark = f"turn-{self._marks}"

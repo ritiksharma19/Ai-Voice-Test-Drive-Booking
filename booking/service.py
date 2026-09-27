@@ -99,6 +99,7 @@ class BookingService:
     def now(self) -> datetime:
         return self._clock().astimezone(self.tz)
 
+    # FLOW L10: dispatch the <action> → check_availability() or book().
     async def execute(self, action: dict, session_id: str = "", language: str = "en") -> dict:
         """Run one LLM action; never raises."""
         name = str(action.get("name", "")).strip()

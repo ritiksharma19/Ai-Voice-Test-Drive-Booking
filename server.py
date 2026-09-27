@@ -12,6 +12,10 @@ Pipeline per user turn (one WebSocket per browser tab or phone call):
   • Browser sessions: optional ACCESS_TOKEN, MAX_SESSIONS cap, MAX_TURNS_PER_MINUTE.
   • Phone calls (Exotel) arrive at /telephony/exotel; see telephony/exotel.py.
   • Per-turn stage timings are logged, sent to the client and aggregated at /metrics.
+
+To follow one turn through the code, search for "FLOW" comments:
+  B* browser (static/app.js) · S* server.py · L* LLM / retrieval / booking
+  T* streaming TTS · P* phone calls (telephony/exotel.py, core/vad.py)
 """
 from __future__ import annotations
 
@@ -73,6 +77,7 @@ engines = Engines()
 # LIFESPAN — build and warm every engine concurrently
 # ────────────────────────────────────────────────────────────────────────────
 
+# FLOW 0 (startup): build and warm STT, LLM, TTS, language ID and VAD in parallel.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 VoiceAgent starting — loading engines in parallel…")
@@ -281,6 +286,7 @@ async def request_callback(body: dict, request: Request, token: str = ""):
 # TELEPHONY — Exotel Voicebot applet (bidirectional stream)
 # ────────────────────────────────────────────────────────────────────────────
 
+# FLOW P1 (phone): Exotel opens one WebSocket per call; ExotelCall.run() handles it.
 @app.websocket("/telephony/exotel")
 async def exotel_stream(ws: WebSocket) -> None:
     if not exotel.authorized(ws, settings.exotel_ws_token):
@@ -317,6 +323,7 @@ _MAX_FRAME_BYTES = settings.max_audio_seconds * 16_000 * 2 * 2 + 44   # allow 32
 _active_sessions = 0
 
 
+# FLOW S1 (browser): one WebSocket per tab. Auth + session cap, then the receive loop at the bottom.
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     global _active_sessions
@@ -349,6 +356,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         turn_times.append(now)
         return False
 
+    # Barge-in helper: cancelling the turn task stops STT, the LLM and pending TTS at once.
     async def cancel_current(notify: bool) -> None:
         nonlocal current
         if current and not current.done():
@@ -367,17 +375,22 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         except Exception:
             pass   # socket already closed
 
+    # FLOW S4: stream the LLM reply (LLMOrchestrator.stream_reply) into StreamingTTS;
+    # each synthesized segment goes back to the browser as an audio_chunk.
     async def respond(user_text: str, language: str, timer: TurnTimer) -> None:
         await ws.send_json({"type": "status", "status": "thinking"})
 
+        # FLOW T4: called by StreamingTTS._send_loop, in order, once per spoken segment.
         async def emit(text: str, speech) -> None:
             await ws.send_json({"type": "audio_chunk", "audio": speech.audio_b64,
                                 "format": speech.fmt, "text": text})
 
+        # FLOW T1: TTS pipeline for this turn (core/speech_stream.py).
         tts = StreamingTTS(engines.tts, emit, language, timer, settings)
         reply: list[str] = []
         source = "none"
         try:
+            # FLOW L1: yields text chunks to speak, plus at most one {"booking": ...}.
             async for chunk in engines.llm.stream_reply(user_text, session_id, language, timer):
                 if chunk.get("booking"):
                     await ws.send_json({"type": "booking", "booking": chunk["booking"]})
@@ -386,7 +399,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     source = chunk["source"]
                 reply.append(chunk["text"])
                 await ws.send_json({"type": "chunk", "text": chunk["text"]})
+                # FLOW T2: the chunker cuts speakable segments; each starts TTS immediately.
                 tts.feed(chunk["text"])
+            # FLOW T5: flush the last segment and wait until every audio chunk is sent.
             await tts.finish()
         except asyncio.CancelledError:
             tts.cancel()
@@ -409,12 +424,14 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         await ws.send_json({"type": "done", "text": "".join(reply), "audio": None, "source": source})
         await ws.send_json({"type": "metrics", "timings_ms": timer.summary()})
 
+    # FLOW S3: one user turn, run as its own task (see create_task in the receive loop).
     async def turn(timer: TurnTimer, wav: bytes | None = None, text: str = "") -> None:
         """One user turn: STT (for audio), then the reply. Runs as a task so the
         receive loop stays free for barge-in while Whisper is busy."""
         if wav is not None:
             try:
                 samples, sr = parse_wav(wav)
+                # FLOW S3a: speech → text (backend chosen by STT_PROVIDER, stt/__init__.py).
                 result = await engines.stt.transcribe(samples, sr)
             except Exception as exc:
                 logger.error("STT error: %r", exc)
@@ -424,6 +441,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             text = result["text"].strip()
             if not text:
                 return
+            # FLOW S3b: reply language (script + STT hint), e.g. en / hi / ta.
             language = lang.detect_language(text, result.get("language"))
             await ws.send_json({"type": "transcription", "text": text})
         else:
@@ -433,6 +451,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
     try:
         while True:
+            # FLOW S2: receive loop — binary frame = WAV from the mic, JSON = text or interrupt.
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
@@ -466,6 +485,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             else:
                 continue
 
+            # A new message always replaces the turn in progress.
             await cancel_current(notify=True)
             if wav is not None and len(wav) > _MAX_FRAME_BYTES:
                 await send_error("Audio too long — please keep it under "
@@ -475,6 +495,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 logger.warning("Rate limit reached | session=%s", session_id)
                 await send_error("You're sending messages too quickly. Please wait a moment.")
                 continue
+            # FLOW S3 starts here; the loop keeps receiving so an interrupt can cancel it.
             current = asyncio.create_task(turn(TurnTimer(), wav, user_text))
 
     except WebSocketDisconnect:

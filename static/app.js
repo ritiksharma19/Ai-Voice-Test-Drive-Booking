@@ -173,6 +173,7 @@ function setupWebSocket() {
         _wsReconnectDelay = 1000;
     };
 
+    // FLOW B4: server messages: status → transcription → chunk / audio_chunk → done → metrics.
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
 
@@ -273,6 +274,7 @@ function playNextAudioChunk() {
     activeAudio.play().catch(() => { activeAudio = null; playNextAudioChunk(); });
 }
 
+// FLOW B5: audio chunks play one after another (playNextAudioChunk).
 function queueAudioChunk(b64Audio, format = "wav", text = null) {
     audioQueue.push({ b64Audio, format, text });
     if (!isPlayingAudioQueue) {
@@ -352,6 +354,7 @@ function stopMediaRecorderAndContext() {
     pcmBuffer = [];
 }
 
+// FLOW B1: open the mic, collect 16 kHz PCM, run the client-side VAD (checkAudio).
 async function startListening() {
     if (!isListeningEnabled) return;
 
@@ -414,6 +417,7 @@ async function startListening() {
 
     startWaveform();
 
+    // FLOW B2: every animation frame: RMS vs noise floor → barge-in / end of speech.
     function checkAudio() {
         if (!isListeningEnabled) return;
 
@@ -439,6 +443,7 @@ async function startListening() {
                 && rms > threshold * BARGE_IN_MULTIPLIER
                 && sinceStarted > BARGE_IN_COOLDOWN
             ) {
+                // Barge-in: stop playback and tell the server to cancel the current turn.
                 bargedIn = true;
                 pcmBuffer = [];       // discard pre-barge audio (contains bot echo)
                 speechDetected = true;     // user is actively speaking — skip the start threshold
@@ -459,6 +464,7 @@ async function startListening() {
                         const samples = new Float32Array(pcmBuffer);
                         pcmBuffer = [];
                         speechDetected = false;
+                        // VAD_SILENCE_MS of silence → send the utterance as one WAV.
                         sendPcmToServer(samples, TARGET_SR);
                     }
                 }, SILENCE_MS);
@@ -538,6 +544,7 @@ function drawWaveform() {
 // FLOW
 // ==========================================================================
 
+// FLOW B6: reply finished → listen again (back to B1).
 function finishSpeakingCycle() {
     stopWaveform();
     if (isListeningEnabled) {
@@ -576,6 +583,7 @@ async function sendTextToServer(text) {
     }
 }
 
+// FLOW B3: WAV bytes → server.py websocket_endpoint (binary frame).
 function sendPcmToServer(samples, sampleRate) {
     stopMediaRecorderAndContext();
     stopAllSpeech();

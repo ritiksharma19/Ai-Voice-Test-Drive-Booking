@@ -71,6 +71,7 @@ class TTSRouter:
     def describe(self) -> str:
         return "+".join(self.engines)
 
+    # FLOW T3a: cache → engines for this language (cooling-down ones last) → Speech.
     async def synthesize(self, text: str, language: str = "en") -> Speech | None:
         key = (language, text)
         cached = self._cache.get(key)

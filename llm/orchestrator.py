@@ -138,6 +138,8 @@ class LLMOrchestrator:
 
     # ── main entry point ──────────────────────────────────────────────────────
 
+    # FLOW L1: the brain of a turn. Order: booking mode → topic guard → retrieval plan
+    # → (filler) → prompt → LLM stream with failover → booking actions → history.
     async def stream_reply(
         self,
         user_text: str,
@@ -151,7 +153,9 @@ class LLMOrchestrator:
         history = list(self._history(session_id))
         self._append(session_id, "user", user_text)
 
+        # FLOW L2: booking mode (booking/intent.py) — booking answers never go to web search.
         booking = self._booking_active(session_id, user_text)
+        # FLOW L3: topic guard (llm/topic_guard.py) — only on-topic text may use the web.
         on_topic = (booking or is_conversational(user_text)
                     or contains_contact_details(user_text) or self.guard.is_on_topic(user_text))
         search_text = user_text
@@ -161,11 +165,14 @@ class LLMOrchestrator:
             # with the previous question. Web search still needs this message
             # itself to be on topic.
             search_text = f"{prev_text} {user_text}"
+        # FLOW L4: sources to try: (), ("kb",), ("web",) or ("kb", "web").
         sources = self.retrieval.plan(search_text, booking, allow_web=on_topic)
         spoken: list[str] = []          # text of the current round, for history
+        # FLOW L5: start the lookup (RetrievalService.get_context → _kb_then_web).
         retrieval = asyncio.create_task(
             self.retrieval.get_context(search_text, self.s.retrieval_wait, sources))
         try:
+            # FLOW L6: web search still running → speak a short "let me check" filler.
             if "web" in sources:
                 done, _ = await asyncio.wait({retrieval}, timeout=self.s.retrieval_filler_after)
                 if not done:
@@ -184,6 +191,7 @@ class LLMOrchestrator:
             logger.info("Topic guard: no car/dealership match — model asked to check scope")
         self.last_topic[session_id] = (search_text[-200:], on_topic or source != "none")
 
+        # FLOW L7: prompt = history + this message with its context (llm/prompts.py).
         messages = [*history, {"role": "user", "content": build_user_message(
             user_text, source, found["context"], topic_check=topic_check)}]
         system = build_system_prompt(self.s, language, self.bookings.now())
@@ -191,6 +199,8 @@ class LLMOrchestrator:
         llm_started = False
         provider = ""
         try:
+            # FLOW L8: stream the reply. If the model writes an <action> tag, run it and
+            # stream again so the model can speak the result (max _MAX_ACTION_ROUNDS actions).
             for round_no in range(_MAX_ACTION_ROUNDS + 1):
                 action_filter = ActionFilter()
                 async with self._sem:
@@ -198,6 +208,7 @@ class LLMOrchestrator:
                         if not llm_started:
                             timer.mark("llm_ttft")
                             llm_started = True
+                        # FLOW L9: ActionFilter passes speakable text through and hides <action>…</action>.
                         say = action_filter.feed(text)
                         if say:
                             spoken.append(say)
@@ -215,6 +226,7 @@ class LLMOrchestrator:
                     break
 
                 action = action_filter.action or {}
+                # FLOW L10: run the booking action (BookingService.execute).
                 result = (await self.bookings.execute(action, session_id, language) if action
                           else {"status": "error", "error": "invalid_action_format",
                                 "message": "The action tag must contain valid JSON."})
@@ -228,6 +240,7 @@ class LLMOrchestrator:
 
                 call = "".join(spoken) + action_filter.raw_tag
                 spoken.clear()
+                # Feed the [ACTION RESULT] back to the model for the next round.
                 result_msg = build_action_result(result)
                 self._append(session_id, "assistant", call)
                 self._append(session_id, "user", result_msg)
@@ -235,9 +248,11 @@ class LLMOrchestrator:
                              {"role": "user", "content": result_msg}]
         finally:
             # Also runs on barge-in (cancellation): keep what was actually said.
+            # FLOW L11: save what was actually said to history (also on barge-in).
             if spoken:
                 self._append(session_id, "assistant", "".join(spoken))
 
+    # FLOW L8a: try providers in order; switch only before the first token arrives.
     async def _stream_with_failover(self, system: str, messages: list[dict]
                                     ) -> AsyncIterator[tuple[str, str]]:
         now = time.monotonic()
